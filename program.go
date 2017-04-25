@@ -1,14 +1,12 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
-	"log"
-	"os"
-
 	"io"
 	"io/ioutil"
+	"log"
+	"os"
 
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
 	"github.com/Azure/azure-sdk-for-go/arm/network"
@@ -29,6 +27,7 @@ var (
 	errLog    *log.Logger
 	statusLog *log.Logger
 	debugLog  *log.Logger
+	wait      bool
 )
 
 const (
@@ -39,6 +38,8 @@ const (
 func main() {
 	var group resources.Group
 	var sampleVM compute.VirtualMachine
+	var sampleNetwork network.VirtualNetwork
+
 	var authorizer autorest.Authorizer
 	exitStatus := 1
 	defer func() {
@@ -60,13 +61,29 @@ func main() {
 	if temp, deleter, err := setupResourceGroup(userSubscriptionID, authorizer); err == nil {
 		group = temp
 		statusLog.Print("Created Resource Group: ", *group.Name)
-		defer deleter()
+		defer func() {
+			if wait {
+				fmt.Print("press ENTER to continue...")
+				fmt.Scanln()
+			}
+			statusLog.Print("Deleting Resource Group: ", *group.Name)
+			deleter()
+		}()
 	} else {
 		errLog.Printf("could not create resource group. Error: %v", err)
+		return
+	}
+
+	if temp, err := setupVirtualNetwork(userSubscriptionID, group, authorizer); err == nil {
+		sampleNetwork = temp
+		statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
+	} else {
+		errLog.Printf("could not create virtual network. Error: %v", err)
+		return
 	}
 
 	// Create an Azure Virtual Machine, on which we'll install an extension.
-	if temp, err := setupVirtualMachine(userSubscriptionID, *group.Name, authorizer, nil); err == nil {
+	if temp, err := setupVirtualMachine(userSubscriptionID, group, authorizer, nil); err == nil {
 		sampleVM = temp
 		statusLog.Print("Created Virtual Machine: ", *sampleVM.Name)
 	} else {
@@ -88,6 +105,7 @@ func init() {
 	unformattedSubscriptionID := flag.String("subscription", os.Getenv("AZURE_SUBSCRIPTION_ID"), "The subscription that will be targeted when running this sample.")
 	unformattedTenantID := flag.String("tenant", os.Getenv("AZURE_TENANT_ID"), "The tenant that hosts the subscription to be used by this sample.")
 	printDebug := flag.Bool("debug", false, "Include debug information in the output of this program.")
+	flag.BoolVar(&wait, "wait", false, "Use to wait for user acknowledgement before deletion of the created assets.")
 	flag.Parse()
 
 	ensureGUID := func(name, raw string) string {
@@ -121,7 +139,9 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 	resourceClient := resources.NewGroupsClient(subscriptionID)
 	resourceClient.Authorizer = authorizer
 
-	created, err = resourceClient.CreateOrUpdate(getTempResourceGroupName(), resources.Group{
+	name := fmt.Sprintf("sample-rg%s", guid.NewGUID().Stringf(guid.FormatN))
+
+	created, err = resourceClient.CreateOrUpdate(name, resources.Group{
 		Location: to.StringPtr(location),
 	})
 
@@ -136,7 +156,7 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 	return
 }
 
-func setupVirtualMachine(subscriptionID, resourceGroup string, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
+func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
 	client := compute.NewVirtualMachinesClient(subscriptionID)
 	client.Authorizer = authorizer
 
@@ -149,8 +169,8 @@ func setupVirtualMachine(subscriptionID, resourceGroup string, authorizer autore
 
 	vmName := fmt.Sprintf("sample-vm%s", guid.NewGUID().Stringf(guid.FormatN))
 
-	arguments := compute.VirtualMachine{
-		Location: to.StringPtr(location),
+	if _, err = client.CreateOrUpdate(*resourceGroup.Name, vmName, compute.VirtualMachine{
+		Location: resourceGroup.Location,
 		VirtualMachineProperties: &compute.VirtualMachineProperties{
 			HardwareProfile: &compute.HardwareProfile{
 				VMSize: compute.BasicA0,
@@ -166,54 +186,130 @@ func setupVirtualMachine(subscriptionID, resourceGroup string, authorizer autore
 			NetworkProfile: &compute.NetworkProfile{
 				NetworkInterfaces: &[]compute.NetworkInterfaceReference{
 					compute.NetworkInterfaceReference{
-						ID: netAccess.ID,
+						ID: netAccess.ResourceGUID,
+						NetworkInterfaceReferenceProperties: &compute.NetworkInterfaceReferenceProperties{},
 					},
 				},
 			},
 		},
-	}
-
-	if _, err = client.CreateOrUpdate(resourceGroup, vmName, arguments, cancel); err == nil {
-		created, err = client.Get(resourceGroup, vmName, compute.InstanceView)
+	}, cancel); err == nil {
+		created, err = client.Get(*resourceGroup.Name, vmName, compute.InstanceView)
 	}
 	return
 }
 
-func setupNetworkInterface(subscriptionID, resourceGroup string, authorizer autorest.Authorizer) (created network.Interface, err error) {
-	client := network.NewInterfacesClient(subscriptionID)
-	client.Authorizer = authorizer
+func setupVirtualNetwork(subscriptionID string, resourceGroup resources.Group, authorizer autorest.Authorizer) (created network.VirtualNetwork, err error) {
+	networkClient := network.NewVirtualNetworksClient(subscriptionID)
+	networkClient.Authorizer = authorizer
 
-	arguments := network.Interface{
-		Location: to.StringPtr(location),
-		InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
-			IPConfigurations: &[]network.InterfaceIPConfiguration{
-				network.InterfaceIPConfiguration{
-					InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{},
+	const networkName = "sampleNetwork"
+
+	_, err = networkClient.CreateOrUpdate(*resourceGroup.Name, networkName, network.VirtualNetwork{
+		Location: resourceGroup.Location,
+		VirtualNetworkPropertiesFormat: &network.VirtualNetworkPropertiesFormat{
+			AddressSpace: &network.AddressSpace{
+				AddressPrefixes: &[]string{
+					"192.168.0.0/16",
 				},
 			},
 		},
-	}
-
-	name := "sample-networkInterface"
-
-	_, err = client.CreateOrUpdate(resourceGroup, name, arguments, nil)
+	}, nil)
 	if err != nil {
 		return
 	}
 
-	created, err = client.Get(resourceGroup, name, "")
+	subnetClient := network.NewSubnetsClient(subscriptionID)
+	subnetClient.Authorizer = authorizer
+
+	const subnetName = "sampleSubnet"
+
+	_, err = subnetClient.CreateOrUpdate(*resourceGroup.Name, networkName, "sampleSubnet", network.Subnet{
+		SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
+			AddressPrefix: to.StringPtr("192.168.1.0/24"),
+		},
+	}, nil)
+	if err != nil {
+		return
+	}
+
+	created, err = networkClient.Get(*resourceGroup.Name, networkName, "")
+
 	return
 }
 
-func setupIPConfiguration(subscriptionID string, authorizer autorest.Authorizer) (network.InterfaceIPConfiguration, error) {
-	return network.InterfaceIPConfiguration{}, errors.New("not implemented")
+func setupNetworkInterface(subscriptionID string, resourceGroup resources.Group, authorizer autorest.Authorizer) (created network.Interface, err error) {
+	client := network.NewInterfacesClient(subscriptionID)
+	client.Authorizer = authorizer
+
+	var ip network.PublicIPAddress
+
+	ip, err = setupPublicIP(subscriptionID, resourceGroup, authorizer)
+	if err != nil {
+		return
+	}
+
+	statusLog.Print("Created Public IP Address: ", *ip.Name, " ", *ip.IPAddress)
+
+	name := "sample-networkInterface"
+
+	_, err = client.CreateOrUpdate(*resourceGroup.Name, name, network.Interface{
+		Location: resourceGroup.Location,
+		InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
+			IPConfigurations: &[]network.InterfaceIPConfiguration{
+			// network.InterfaceIPConfiguration{
+			// 	InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
+			// 	PrivateIPAllocationMethod: network.Dynamic,
+			// 	Primary:                   to.BoolPtr(true),
+			// 	PublicIPAddress:           &ip,
+			// 	},
+			// },
+			},
+		},
+	}, nil)
+	if err != nil {
+		return
+	}
+
+	created, err = client.Get(*resourceGroup.Name, name, "")
+	return
 }
 
-// getTempResourceGroupName generates a name of a resource group name that will not conflict with other resource groups.
-func getTempResourceGroupName() string {
-	randID := guid.NewGUID()
+func setupNetworkSecurityGroup(subscriptionID, resourceGroupName string, authorizer autorest.Authorizer) (created network.SecurityGroup, err error) {
+	client := network.NewSecurityGroupsClient(subscriptionID)
+	client.Authorizer = authorizer
 
-	return fmt.Sprintf("sample-rg%s", randID.Stringf(guid.FormatN))
+	name := "sample-nsg"
+
+	_, err = client.CreateOrUpdate(resourceGroupName, name, network.SecurityGroup{
+		Location:                      to.StringPtr(location),
+		SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{},
+	}, nil)
+	if err != nil {
+		return
+	}
+
+	created, err = client.Get(resourceGroupName, name, "")
+	return
+}
+
+func setupPublicIP(subscriptionID string, group resources.Group, authorizer autorest.Authorizer) (created network.PublicIPAddress, err error) {
+	client := network.NewPublicIPAddressesClient(subscriptionID)
+	client.Authorizer = authorizer
+
+	name := "sample-publicip"
+
+	_, err = client.CreateOrUpdate(*group.Name, name, network.PublicIPAddress{
+		Location: group.Location,
+		PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+			PublicIPAllocationMethod: network.Static,
+		},
+	}, nil)
+	if err != nil {
+		return
+	}
+
+	created, err = client.Get(*group.Name, name, "")
+	return
 }
 
 // authenticate gets an authorization token to allow clients to access Azure assets.
