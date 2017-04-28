@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
+	"github.com/Azure/azure-sdk-for-go/arm/disk"
 	"github.com/Azure/azure-sdk-for-go/arm/network"
 	"github.com/Azure/azure-sdk-for-go/arm/resources/resources"
 	"github.com/Azure/azure-sdk-for-go/arm/storage"
@@ -97,14 +98,47 @@ func main() {
 	}
 	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
 
-	// Create an Azure Virtual Machine, on which we'll install an extension.
-	if temp, err := setupVirtualMachine(userSubscriptionID, group, sampleStorageAccount, (*sampleNetwork.Subnets)[0], authorizer, nil); err == nil {
+	// Create an encrypted Data Disk
+	sampleDataDisk, err := setupEncryptedDataDisk(userSubscriptionID, group, sampleStorageAccount, authorizer)
+	if err != nil {
+		errLog.Print(err)
+		return
+	}
+	// var sampleStorageAccountType compute.StorageAccountTypes
+	// switch sampleDisk.AccountType {
+	// case disk.StandardLRS:
+	// 	sampleStorageAccountType = compute.StandardLRS
+	// case disk.PremiumLRS:
+	// 	sampleStorageAccountType = compute.PremiumLRS
+	// default:
+	// 	errLog.Print("Unknown Storage Account Type: ", *sampleStorageAccount.Type)
+	// 	return
+	// }
+
+	dataDisks := []compute.DataDisk{
+		{
+			ManagedDisk: &compute.ManagedDiskParameters{
+				ID:                 sampleDataDisk.ID,
+				StorageAccountType: compute.StorageAccountTypes(sampleDataDisk.AccountType),
+			},
+		},
+	}
+
+	osDisk := compute.OSDisk{
+		ManagedDisk: &compute.ManagedDiskParameters{},
+	}
+
+	// Create an Azure Virtual Machine, on which we'll mount an encrypted data disk.
+	if temp, err := setupVirtualMachine(userSubscriptionID, group, sampleStorageAccount, osDisk, dataDisks, (*sampleNetwork.Subnets)[0], authorizer, nil); err == nil {
 		sampleVM = temp
 		statusLog.Print("Created Virtual Machine: ", *sampleVM.Name)
 	} else {
 		errLog.Print(err)
 		return
 	}
+
+	vmClient := compute.NewVirtualMachinesClient(userSubscriptionID)
+	vmClient.Authorizer = authorizer
 
 	exitStatus = 0
 }
@@ -172,7 +206,30 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 	return
 }
 
-func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, storageAccount storage.Account, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
+func setupEncryptedDataDisk(subscriptionID string, group resources.Group, account storage.Account, authorizer autorest.Authorizer) (created disk.Model, err error) {
+	client := disk.NewDisksClient(subscriptionID)
+	client.Authorizer = authorizer
+
+	diskName := "sampleDataDisk"
+
+	_, err = client.CreateOrUpdate(*group.Name, diskName, disk.Model{
+		Location: group.Location,
+		Properties: &disk.Properties{
+			CreationData: &disk.CreationData{
+				CreateOption: disk.Empty,
+			},
+			DiskSizeGB: to.Int32Ptr(64),
+		},
+	}, nil)
+	if err != nil {
+		return
+	}
+
+	created, err = client.Get(*group.Name, diskName)
+	return
+}
+
+func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, storageAccount storage.Account, osDisk compute.OSDisk, dataDisks []compute.DataDisk, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
 	var networkCard network.Interface
 
 	client := compute.NewVirtualMachinesClient(subscriptionID)
@@ -219,13 +276,8 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, s
 					Sku:       to.StringPtr("14.04.5-LTS"),
 					Version:   to.StringPtr("latest"),
 				},
-				OsDisk: &compute.OSDisk{
-					Name: to.StringPtr("osDisk"),
-					Vhd: &compute.VirtualHardDisk{
-						URI: to.StringPtr(fmt.Sprintf("https://%s.blob.core.windows.net/golangcontainer/%s.vhd", *storageAccount.Name, vmName)),
-					},
-					CreateOption: compute.FromImage,
-				},
+				OsDisk:    &osDisk,
+				DataDisks: &dataDisks,
 			},
 		},
 	}, cancel); err == nil {
