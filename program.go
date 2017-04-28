@@ -83,7 +83,7 @@ func main() {
 	}
 
 	// Create an Azure Virtual Machine, on which we'll install an extension.
-	if temp, err := setupVirtualMachine(userSubscriptionID, group, authorizer, nil); err == nil {
+	if temp, err := setupVirtualMachine(userSubscriptionID, group, (*sampleNetwork.Subnets)[0], authorizer, nil); err == nil {
 		sampleVM = temp
 		statusLog.Print("Created Virtual Machine: ", *sampleVM.Name)
 	} else {
@@ -147,7 +147,10 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 
 	if err == nil {
 		deleter = func() {
-			resourceClient.Delete(*created.Name, nil)
+			_, err = resourceClient.Delete(*created.Name, nil)
+			if err == nil {
+				return
+			}
 		}
 	} else {
 		deleter = func() {}
@@ -156,18 +159,21 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 	return
 }
 
-func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
+func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
+	var networkCard network.Interface
+
 	client := compute.NewVirtualMachinesClient(subscriptionID)
 	client.Authorizer = authorizer
 
-	var netAccess network.Interface
+	vmName := fmt.Sprintf("sample-vm%s", guid.NewGUID().Stringf(guid.FormatN))
+	debugLog.Print("VM Name: ", vmName)
 
-	netAccess, err = setupNetworkInterface(subscriptionID, resourceGroup, authorizer)
+	networkCard, err = setupNetworkInterface(subscriptionID, resourceGroup, subnet, network.SubResource{ID: to.StringPtr(vmName)}, authorizer)
 	if err != nil {
 		return
 	}
 
-	vmName := fmt.Sprintf("sample-vm%s", guid.NewGUID().Stringf(guid.FormatN))
+	debugLog.Print("NIC ID: ", *networkCard.ID)
 
 	if _, err = client.CreateOrUpdate(*resourceGroup.Name, vmName, compute.VirtualMachine{
 		Location: resourceGroup.Location,
@@ -186,14 +192,27 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, a
 			NetworkProfile: &compute.NetworkProfile{
 				NetworkInterfaces: &[]compute.NetworkInterfaceReference{
 					compute.NetworkInterfaceReference{
-						ID: netAccess.ResourceGUID,
-						NetworkInterfaceReferenceProperties: &compute.NetworkInterfaceReferenceProperties{},
+						ID: networkCard.ID,
+						NetworkInterfaceReferenceProperties: &compute.NetworkInterfaceReferenceProperties{
+							Primary: to.BoolPtr(true),
+						},
 					},
+				},
+			},
+			StorageProfile: &compute.StorageProfile{
+				OsDisk: &compute.OSDisk{
+					CreateOption: compute.FromImage,
+					OsType:       compute.Linux,
+					DiskSizeGB:   to.Int32Ptr(128),
 				},
 			},
 		},
 	}, cancel); err == nil {
 		created, err = client.Get(*resourceGroup.Name, vmName, compute.InstanceView)
+	}
+
+	if err != nil {
+		return
 	}
 	return
 }
@@ -237,7 +256,7 @@ func setupVirtualNetwork(subscriptionID string, resourceGroup resources.Group, a
 	return
 }
 
-func setupNetworkInterface(subscriptionID string, resourceGroup resources.Group, authorizer autorest.Authorizer) (created network.Interface, err error) {
+func setupNetworkInterface(subscriptionID string, resourceGroup resources.Group, subnet network.Subnet, machine network.SubResource, authorizer autorest.Authorizer) (created network.Interface, err error) {
 	client := network.NewInterfacesClient(subscriptionID)
 	client.Authorizer = authorizer
 
@@ -256,13 +275,15 @@ func setupNetworkInterface(subscriptionID string, resourceGroup resources.Group,
 		Location: resourceGroup.Location,
 		InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
 			IPConfigurations: &[]network.InterfaceIPConfiguration{
-			// network.InterfaceIPConfiguration{
-			// 	InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-			// 	PrivateIPAllocationMethod: network.Dynamic,
-			// 	Primary:                   to.BoolPtr(true),
-			// 	PublicIPAddress:           &ip,
-			// 	},
-			// },
+				{
+					Name: to.StringPtr(fmt.Sprintf("ipConfig-%s", *machine.ID)),
+					InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
+						PrivateIPAllocationMethod: network.Dynamic,
+						Primary:                   to.BoolPtr(true),
+						PublicIPAddress:           &ip,
+						Subnet:                    &subnet,
+					},
+				},
 			},
 		},
 	}, nil)
