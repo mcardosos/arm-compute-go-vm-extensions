@@ -7,10 +7,12 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
 	"github.com/Azure/azure-sdk-for-go/arm/network"
 	"github.com/Azure/azure-sdk-for-go/arm/resources/resources"
+	"github.com/Azure/azure-sdk-for-go/arm/storage"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
@@ -39,6 +41,7 @@ func main() {
 	var group resources.Group
 	var sampleVM compute.VirtualMachine
 	var sampleNetwork network.VirtualNetwork
+	var sampleStorageAccount storage.Account
 
 	var authorizer autorest.Authorizer
 	exitStatus := 1
@@ -74,13 +77,25 @@ func main() {
 		return
 	}
 
-	if temp, err := setupVirtualNetwork(userSubscriptionID, group, authorizer); err == nil {
-		sampleNetwork = temp
-		statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
-	} else {
-		errLog.Printf("could not create virtual network. Error: %v", err)
+	// Create Pre-requisites for a VM. Because they are independent, we can do so in parallel.
+	storageAccountResults, storageAccountErrs := setupStorageAccount(userSubscriptionID, group, authorizer)
+	virtualNetworkResults, virtualNetworkErrs := setupVirtualNetwork(userSubscriptionID, group, authorizer)
+
+	select {
+	case sampleStorageAccount = <-storageAccountResults:
+	case err := <-storageAccountErrs:
+		errLog.Print(err)
 		return
 	}
+	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
+
+	select {
+	case sampleNetwork = <-virtualNetworkResults:
+	case err := <-virtualNetworkErrs:
+		errLog.Print(err)
+		return
+	}
+	statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
 
 	// Create an Azure Virtual Machine, on which we'll install an extension.
 	if temp, err := setupVirtualMachine(userSubscriptionID, group, (*sampleNetwork.Subnets)[0], authorizer, nil); err == nil {
@@ -179,7 +194,7 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, s
 		Location: resourceGroup.Location,
 		VirtualMachineProperties: &compute.VirtualMachineProperties{
 			HardwareProfile: &compute.HardwareProfile{
-				VMSize: compute.BasicA0,
+				VMSize: compute.StandardDS1V2,
 			},
 			OsProfile: &compute.OSProfile{
 				ComputerName:  to.StringPtr(vmName),
@@ -191,19 +206,12 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, s
 			},
 			NetworkProfile: &compute.NetworkProfile{
 				NetworkInterfaces: &[]compute.NetworkInterfaceReference{
-					compute.NetworkInterfaceReference{
+					{
 						ID: networkCard.ID,
 						NetworkInterfaceReferenceProperties: &compute.NetworkInterfaceReferenceProperties{
 							Primary: to.BoolPtr(true),
 						},
 					},
-				},
-			},
-			StorageProfile: &compute.StorageProfile{
-				OsDisk: &compute.OSDisk{
-					CreateOption: compute.FromImage,
-					OsType:       compute.Linux,
-					DiskSizeGB:   to.Int32Ptr(128),
 				},
 			},
 		},
@@ -217,43 +225,60 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, s
 	return
 }
 
-func setupVirtualNetwork(subscriptionID string, resourceGroup resources.Group, authorizer autorest.Authorizer) (created network.VirtualNetwork, err error) {
-	networkClient := network.NewVirtualNetworksClient(subscriptionID)
-	networkClient.Authorizer = authorizer
+func setupVirtualNetwork(subscriptionID string, resourceGroup resources.Group, authorizer autorest.Authorizer) (<-chan network.VirtualNetwork, <-chan error) {
+	results, errs := make(chan network.VirtualNetwork), make(chan error)
 
-	const networkName = "sampleNetwork"
+	go func() {
+		defer close(errs)
+		defer close(results)
 
-	_, err = networkClient.CreateOrUpdate(*resourceGroup.Name, networkName, network.VirtualNetwork{
-		Location: resourceGroup.Location,
-		VirtualNetworkPropertiesFormat: &network.VirtualNetworkPropertiesFormat{
-			AddressSpace: &network.AddressSpace{
-				AddressPrefixes: &[]string{
-					"192.168.0.0/16",
+		var err error
+
+		networkClient := network.NewVirtualNetworksClient(subscriptionID)
+		networkClient.Authorizer = authorizer
+
+		const networkName = "sampleNetwork"
+
+		_, err = networkClient.CreateOrUpdate(*resourceGroup.Name, networkName, network.VirtualNetwork{
+			Location: resourceGroup.Location,
+			VirtualNetworkPropertiesFormat: &network.VirtualNetworkPropertiesFormat{
+				AddressSpace: &network.AddressSpace{
+					AddressPrefixes: &[]string{
+						"192.168.0.0/16",
+					},
 				},
 			},
-		},
-	}, nil)
-	if err != nil {
-		return
-	}
+		}, nil)
+		if err != nil {
+			errs <- err
+			return
+		}
 
-	subnetClient := network.NewSubnetsClient(subscriptionID)
-	subnetClient.Authorizer = authorizer
+		subnetClient := network.NewSubnetsClient(subscriptionID)
+		subnetClient.Authorizer = authorizer
 
-	const subnetName = "sampleSubnet"
+		const subnetName = "sampleSubnet"
 
-	_, err = subnetClient.CreateOrUpdate(*resourceGroup.Name, networkName, "sampleSubnet", network.Subnet{
-		SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
-			AddressPrefix: to.StringPtr("192.168.1.0/24"),
-		},
-	}, nil)
-	if err != nil {
-		return
-	}
+		_, err = subnetClient.CreateOrUpdate(*resourceGroup.Name, networkName, "sampleSubnet", network.Subnet{
+			SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
+				AddressPrefix: to.StringPtr("192.168.1.0/24"),
+			},
+		}, nil)
+		if err != nil {
+			errs <- err
+			return
+		}
 
-	created, err = networkClient.Get(*resourceGroup.Name, networkName, "")
+		created, err := networkClient.Get(*resourceGroup.Name, networkName, "")
+		if err != nil {
+			errs <- err
+			return
+		}
 
-	return
+		results <- created
+	}()
+
+	return results, errs
 }
 
 func setupNetworkInterface(subscriptionID string, resourceGroup resources.Group, subnet network.Subnet, machine network.SubResource, authorizer autorest.Authorizer) (created network.Interface, err error) {
@@ -331,6 +356,43 @@ func setupPublicIP(subscriptionID string, group resources.Group, authorizer auto
 
 	created, err = client.Get(*group.Name, name, "")
 	return
+}
+
+func setupStorageAccount(subscriptionID string, group resources.Group, authorizer autorest.Authorizer) (<-chan storage.Account, <-chan error) {
+	results, errs := make(chan storage.Account), make(chan error)
+
+	go func() {
+		defer close(errs)
+		defer close(results)
+
+		client := storage.NewAccountsClient(subscriptionID)
+		client.Authorizer = authorizer
+
+		storageAccountName := "sample"
+		storageAccountName = storageAccountName + string([]byte(guid.NewGUID().Stringf(guid.FormatN))[:24-len(storageAccountName)])
+		storageAccountName = strings.ToLower(storageAccountName)
+		debugLog.Printf("storageAccountName (length: %d): %s", len(storageAccountName), storageAccountName)
+
+		_, err := client.Create(*group.Name, storageAccountName, storage.AccountCreateParameters{
+			Location: group.Location,
+			Sku: &storage.Sku{
+				Name: storage.StandardLRS,
+			},
+		}, nil)
+		if err != nil {
+			errs <- err
+			return
+		}
+
+		result, err := client.GetProperties(*group.Name, storageAccountName)
+		if err != nil {
+			errs <- err
+			return
+		}
+		results <- result
+	}()
+
+	return results, errs
 }
 
 // authenticate gets an authorization token to allow clients to access Azure assets.
