@@ -82,14 +82,6 @@ func main() {
 	virtualNetworkResults, virtualNetworkErrs := setupVirtualNetwork(userSubscriptionID, group, authorizer)
 
 	select {
-	case sampleStorageAccount = <-storageAccountResults:
-	case err := <-storageAccountErrs:
-		errLog.Print(err)
-		return
-	}
-	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
-
-	select {
 	case sampleNetwork = <-virtualNetworkResults:
 	case err := <-virtualNetworkErrs:
 		errLog.Print(err)
@@ -97,16 +89,22 @@ func main() {
 	}
 	statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
 
+	select {
+	case sampleStorageAccount = <-storageAccountResults:
+	case err := <-storageAccountErrs:
+		errLog.Print(err)
+		return
+	}
+	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
+
 	// Create an Azure Virtual Machine, on which we'll install an extension.
-	if temp, err := setupVirtualMachine(userSubscriptionID, group, (*sampleNetwork.Subnets)[0], authorizer, nil); err == nil {
+	if temp, err := setupVirtualMachine(userSubscriptionID, group, sampleStorageAccount, (*sampleNetwork.Subnets)[0], authorizer, nil); err == nil {
 		sampleVM = temp
 		statusLog.Print("Created Virtual Machine: ", *sampleVM.Name)
 	} else {
 		errLog.Print(err)
 		return
 	}
-
-	statusLog.Print(*sampleVM.Name)
 
 	exitStatus = 0
 }
@@ -174,7 +172,7 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 	return
 }
 
-func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
+func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, storageAccount storage.Account, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
 	var networkCard network.Interface
 
 	client := compute.NewVirtualMachinesClient(subscriptionID)
@@ -196,14 +194,6 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, s
 			HardwareProfile: &compute.HardwareProfile{
 				VMSize: compute.StandardDS1V2,
 			},
-			OsProfile: &compute.OSProfile{
-				ComputerName:  to.StringPtr(vmName),
-				AdminUsername: to.StringPtr("admin"),
-				AdminPassword: to.StringPtr("azureRocksWithGo"),
-				LinuxConfiguration: &compute.LinuxConfiguration{
-					DisablePasswordAuthentication: to.BoolPtr(false),
-				},
-			},
 			NetworkProfile: &compute.NetworkProfile{
 				NetworkInterfaces: &[]compute.NetworkInterfaceReference{
 					{
@@ -212,6 +202,29 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, s
 							Primary: to.BoolPtr(true),
 						},
 					},
+				},
+			},
+			OsProfile: &compute.OSProfile{
+				ComputerName:  to.StringPtr(vmName),
+				AdminUsername: to.StringPtr("sampleuser"),
+				AdminPassword: to.StringPtr("azureRocksWithGo!"),
+				LinuxConfiguration: &compute.LinuxConfiguration{
+					DisablePasswordAuthentication: to.BoolPtr(false),
+				},
+			},
+			StorageProfile: &compute.StorageProfile{
+				ImageReference: &compute.ImageReference{
+					Publisher: to.StringPtr("Canonical"),
+					Offer:     to.StringPtr("UbuntuServer"),
+					Sku:       to.StringPtr("14.04.5-LTS"),
+					Version:   to.StringPtr("latest"),
+				},
+				OsDisk: &compute.OSDisk{
+					Name: to.StringPtr("osDisk"),
+					Vhd: &compute.VirtualHardDisk{
+						URI: to.StringPtr(fmt.Sprintf("https://%s.blob.core.windows.net/golangcontainer/%s.vhd", *storageAccount.Name, vmName)),
+					},
+					CreateOption: compute.FromImage,
 				},
 			},
 		},
