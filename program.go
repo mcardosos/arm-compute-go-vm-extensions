@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/arm/network"
 	"github.com/Azure/azure-sdk-for-go/arm/resources/resources"
 	"github.com/Azure/azure-sdk-for-go/arm/storage"
+	keys "github.com/Azure/azure-sdk-for-go/dataplane/keyvault"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
@@ -110,8 +111,8 @@ func main() {
 	}
 	statusLog.Print("Created Key Vault: ", *sampleVault.Name)
 
-	osDiskResults, osDiskErrs := setupManagedDisk(userSubscriptionID, group, sampleStorageAccount, authorizer)
-	dataDiskResults, dataDiskErrs := setupManagedDisk(userSubscriptionID, group, sampleStorageAccount, authorizer)
+	osDiskResults, osDiskErrs := setupManagedDisk(userSubscriptionID, group, sampleStorageAccount, sampleVault, authorizer)
+	dataDiskResults, dataDiskErrs := setupManagedDisk(userSubscriptionID, group, sampleStorageAccount, sampleVault, authorizer)
 
 	select {
 	case sampleOSDisk = <-osDiskResults:
@@ -128,17 +129,6 @@ func main() {
 		return
 	}
 	statusLog.Print("Created Data Disk: ", *sampleDataDisk.Name)
-
-	// var sampleStorageAccountType compute.StorageAccountTypes
-	// switch sampleDisk.AccountType {
-	// case disk.StandardLRS:
-	// 	sampleStorageAccountType = compute.StandardLRS
-	// case disk.PremiumLRS:
-	// 	sampleStorageAccountType = compute.PremiumLRS
-	// default:
-	// 	errLog.Print("Unknown Storage Account Type: ", *sampleStorageAccount.Type)
-	// 	return
-	// }
 
 	dataDisks := []compute.DataDisk{
 		{
@@ -248,7 +238,10 @@ func setupKeyVault(subscriptionID string, group resources.Group, tenant uuid.UUI
 		client := keyvault.NewVaultsClient(subscriptionID)
 		client.Authorizer = authorizer
 
-		vaultName := "sampleVault"
+		vaultName := uuid.NewV4().String()
+		vaultName = strings.Replace(vaultName, "-", "", -1)
+		vaultName = "vault-" + vaultName
+		vaultName = vaultName[:24]
 
 		created, err := client.CreateOrUpdate(*group.Name, vaultName, keyvault.VaultCreateOrUpdateParameters{
 			Location: group.Location,
@@ -274,19 +267,41 @@ func setupKeyVault(subscriptionID string, group resources.Group, tenant uuid.UUI
 	return results, errs
 }
 
-func setupManagedDisk(subscriptionID string, group resources.Group, account storage.Account, authorizer autorest.Authorizer) (<-chan disk.Model, <-chan error) {
+func setupManagedDisk(subscriptionID string, group resources.Group, account storage.Account, vault keyvault.Vault, authorizer autorest.Authorizer) (<-chan disk.Model, <-chan error) {
 	results, errs := make(chan disk.Model), make(chan error)
 
 	go func() {
 		diskClient := disk.NewDisksClient(subscriptionID)
 		diskClient.Authorizer = authorizer
 
-		vaultClient := keyvault.NewVaultsClient(subscriptionID)
+		vaultClient := keys.New()
 		vaultClient.Authorizer = authorizer
 
 		diskName := "disk-" + uuid.NewV4().String()
 
-		_, err := diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
+		key, err := vaultClient.CreateKey(fmt.Sprintf("https://%s.vault.azure.net", *vault.Name), "key-"+diskName, keys.KeyCreateParameters{
+			KeyAttributes: &keys.KeyAttributes{
+				Enabled: to.BoolPtr(true),
+			},
+			KeySize: to.Int32Ptr(1024),
+			KeyOps: &[]keys.JSONWebKeyOperation{
+				keys.Encrypt,
+				keys.Decrypt,
+			},
+			Kty: keys.RSA,
+		})
+		if err != nil {
+			errs <- err
+			return
+		}
+
+		keyURL, err := key.Location()
+		if err != nil {
+			errs <- err
+			return
+		}
+
+		_, err = diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
 			Location: group.Location,
 			Properties: &disk.Properties{
 				CreationData: &disk.CreationData{
@@ -295,6 +310,12 @@ func setupManagedDisk(subscriptionID string, group resources.Group, account stor
 				DiskSizeGB: to.Int32Ptr(64),
 				EncryptionSettings: &disk.EncryptionSettings{
 					Enabled: to.BoolPtr(true),
+					KeyEncryptionKey: &disk.KeyVaultAndKeyReference{
+						KeyURL: to.StringPtr(keyURL.String()),
+						SourceVault: &disk.SourceVault{
+							ID: vault.ID,
+						},
+					},
 				},
 			},
 		}, nil)
