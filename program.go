@@ -11,18 +11,19 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
 	"github.com/Azure/azure-sdk-for-go/arm/disk"
+	"github.com/Azure/azure-sdk-for-go/arm/keyvault"
 	"github.com/Azure/azure-sdk-for-go/arm/network"
 	"github.com/Azure/azure-sdk-for-go/arm/resources/resources"
 	"github.com/Azure/azure-sdk-for-go/arm/storage"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/marstr/guid"
+	"github.com/satori/uuid"
 )
 
 var (
 	userSubscriptionID string
-	userTenantID       string
+	userTenantID       uuid.UUID
 	environment        = azure.PublicCloud
 )
 
@@ -43,6 +44,8 @@ func main() {
 	var sampleVM compute.VirtualMachine
 	var sampleNetwork network.VirtualNetwork
 	var sampleStorageAccount storage.Account
+	var sampleOSDisk, sampleDataDisk disk.Model
+	var sampleVault keyvault.Vault
 
 	var authorizer autorest.Authorizer
 	exitStatus := 1
@@ -81,6 +84,7 @@ func main() {
 	// Create Pre-requisites for a VM. Because they are independent, we can do so in parallel.
 	storageAccountResults, storageAccountErrs := setupStorageAccount(userSubscriptionID, group, authorizer)
 	virtualNetworkResults, virtualNetworkErrs := setupVirtualNetwork(userSubscriptionID, group, authorizer)
+	vaultResults, vaultErrs := setupKeyVault(userSubscriptionID, group, userTenantID, authorizer)
 
 	select {
 	case sampleNetwork = <-virtualNetworkResults:
@@ -98,12 +102,33 @@ func main() {
 	}
 	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
 
-	// Create an encrypted Data Disk
-	sampleDataDisk, err := setupEncryptedDataDisk(userSubscriptionID, group, sampleStorageAccount, authorizer)
-	if err != nil {
+	select {
+	case sampleVault = <-vaultResults:
+	case err := <-vaultErrs:
 		errLog.Print(err)
 		return
 	}
+	statusLog.Print("Created Key Vault: ", *sampleVault.Name)
+
+	osDiskResults, osDiskErrs := setupManagedDisk(userSubscriptionID, group, sampleStorageAccount, authorizer)
+	dataDiskResults, dataDiskErrs := setupManagedDisk(userSubscriptionID, group, sampleStorageAccount, authorizer)
+
+	select {
+	case sampleOSDisk = <-osDiskResults:
+	case err := <-osDiskErrs:
+		errLog.Print(err)
+		return
+	}
+	statusLog.Print("Created OS Disk: ", *sampleOSDisk.Name)
+
+	select {
+	case sampleDataDisk = <-dataDiskResults:
+	case err := <-dataDiskErrs:
+		errLog.Print(err)
+		return
+	}
+	statusLog.Print("Created Data Disk: ", *sampleDataDisk.Name)
+
 	// var sampleStorageAccountType compute.StorageAccountTypes
 	// switch sampleDisk.AccountType {
 	// case disk.StandardLRS:
@@ -117,6 +142,8 @@ func main() {
 
 	dataDisks := []compute.DataDisk{
 		{
+			CreateOption: compute.Empty,
+			Lun:          to.Int32Ptr(0),
 			ManagedDisk: &compute.ManagedDiskParameters{
 				ID:                 sampleDataDisk.ID,
 				StorageAccountType: compute.StorageAccountTypes(sampleDataDisk.AccountType),
@@ -125,7 +152,11 @@ func main() {
 	}
 
 	osDisk := compute.OSDisk{
-		ManagedDisk: &compute.ManagedDiskParameters{},
+		CreateOption: compute.Empty,
+		ManagedDisk: &compute.ManagedDiskParameters{
+			ID:                 sampleDataDisk.ID,
+			StorageAccountType: compute.StorageAccountTypes(sampleOSDisk.AccountType),
+		},
 	}
 
 	// Create an Azure Virtual Machine, on which we'll mount an encrypted data disk.
@@ -155,10 +186,10 @@ func init() {
 	flag.BoolVar(&wait, "wait", false, "Use to wait for user acknowledgement before deletion of the created assets.")
 	flag.Parse()
 
-	ensureGUID := func(name, raw string) string {
-		var retval string
-		if parsed, err := guid.Parse(raw); err == nil {
-			retval = parsed.String()
+	ensureUUID := func(name, raw string) uuid.UUID {
+		var retval uuid.UUID
+		if parsed, err := uuid.FromString(raw); err == nil {
+			retval = parsed
 		} else {
 			errLog.Printf("'%s' doesn't look like an Azure %s. This sample expects a uuid.", raw, name)
 			badArgs = true
@@ -166,8 +197,8 @@ func init() {
 		return retval
 	}
 
-	userSubscriptionID = ensureGUID("Subscription ID", *unformattedSubscriptionID)
-	userTenantID = ensureGUID("Tenant ID", *unformattedTenantID)
+	userSubscriptionID = ensureUUID("Subscription ID", *unformattedSubscriptionID).String()
+	userTenantID = ensureUUID("Tenant ID", *unformattedTenantID)
 
 	var debugWriter io.Writer
 	if *printDebug {
@@ -186,7 +217,7 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 	resourceClient := resources.NewGroupsClient(subscriptionID)
 	resourceClient.Authorizer = authorizer
 
-	name := fmt.Sprintf("sample-rg%s", guid.NewGUID().Stringf(guid.FormatN))
+	name := fmt.Sprintf("sample-rg%s", uuid.NewV4().String())
 
 	created, err = resourceClient.CreateOrUpdate(name, resources.Group{
 		Location: to.StringPtr(location),
@@ -206,27 +237,77 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 	return
 }
 
-func setupEncryptedDataDisk(subscriptionID string, group resources.Group, account storage.Account, authorizer autorest.Authorizer) (created disk.Model, err error) {
-	client := disk.NewDisksClient(subscriptionID)
-	client.Authorizer = authorizer
+// setupKeyVault creates a secure location to hold the secrets for encrypting and unencrypting the VM created in this sample's OS and Data disks.
+func setupKeyVault(subscriptionID string, group resources.Group, tenant uuid.UUID, authorizer autorest.Authorizer) (<-chan keyvault.Vault, <-chan error) {
+	results, errs := make(chan keyvault.Vault), make(chan error)
 
-	diskName := "sampleDataDisk"
+	go func() {
+		defer close(results)
+		defer close(errs)
 
-	_, err = client.CreateOrUpdate(*group.Name, diskName, disk.Model{
-		Location: group.Location,
-		Properties: &disk.Properties{
-			CreationData: &disk.CreationData{
-				CreateOption: disk.Empty,
+		client := keyvault.NewVaultsClient(subscriptionID)
+		client.Authorizer = authorizer
+
+		vaultName := "sampleVault"
+
+		created, err := client.CreateOrUpdate(*group.Name, vaultName, keyvault.VaultCreateOrUpdateParameters{
+			Location: group.Location,
+			Properties: &keyvault.VaultProperties{
+				AccessPolicies:           &[]keyvault.AccessPolicyEntry{},
+				EnabledForDiskEncryption: to.BoolPtr(true),
+				Sku: &keyvault.Sku{
+					Family: to.StringPtr("A"),
+					Name:   keyvault.Standard,
+				},
+				TenantID: &tenant,
 			},
-			DiskSizeGB: to.Int32Ptr(64),
-		},
-	}, nil)
-	if err != nil {
-		return
-	}
+		})
 
-	created, err = client.Get(*group.Name, diskName)
-	return
+		if err != nil {
+			errs <- err
+			return
+		}
+
+		results <- created
+	}()
+
+	return results, errs
+}
+
+func setupManagedDisk(subscriptionID string, group resources.Group, account storage.Account, authorizer autorest.Authorizer) (<-chan disk.Model, <-chan error) {
+	results, errs := make(chan disk.Model), make(chan error)
+
+	go func() {
+		diskClient := disk.NewDisksClient(subscriptionID)
+		diskClient.Authorizer = authorizer
+
+		vaultClient := keyvault.NewVaultsClient(subscriptionID)
+		vaultClient.Authorizer = authorizer
+
+		diskName := "disk-" + uuid.NewV4().String()
+
+		_, err := diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
+			Location: group.Location,
+			Properties: &disk.Properties{
+				CreationData: &disk.CreationData{
+					CreateOption: disk.Empty,
+				},
+				DiskSizeGB: to.Int32Ptr(64),
+				EncryptionSettings: &disk.EncryptionSettings{
+					Enabled: to.BoolPtr(true),
+				},
+			},
+		}, nil)
+		if err != nil {
+			errs <- err
+			return
+		}
+
+		created, err := diskClient.Get(*group.Name, diskName)
+		results <- created
+	}()
+
+	return results, errs
 }
 
 func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, storageAccount storage.Account, osDisk compute.OSDisk, dataDisks []compute.DataDisk, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
@@ -235,7 +316,7 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, s
 	client := compute.NewVirtualMachinesClient(subscriptionID)
 	client.Authorizer = authorizer
 
-	vmName := fmt.Sprintf("sample-vm%s", guid.NewGUID().Stringf(guid.FormatN))
+	vmName := fmt.Sprintf("sample-vm%s", uuid.NewV4().String())
 	debugLog.Print("VM Name: ", vmName)
 
 	networkCard, err = setupNetworkInterface(subscriptionID, resourceGroup, subnet, network.SubResource{ID: to.StringPtr(vmName)}, authorizer)
@@ -434,7 +515,7 @@ func setupStorageAccount(subscriptionID string, group resources.Group, authorize
 		client.Authorizer = authorizer
 
 		storageAccountName := "sample"
-		storageAccountName = storageAccountName + string([]byte(guid.NewGUID().Stringf(guid.FormatN))[:24-len(storageAccountName)])
+		storageAccountName = storageAccountName + string([]byte(uuid.NewV4().String())[:8])
 		storageAccountName = strings.ToLower(storageAccountName)
 		debugLog.Printf("storageAccountName (length: %d): %s", len(storageAccountName), storageAccountName)
 
@@ -461,13 +542,13 @@ func setupStorageAccount(subscriptionID string, group resources.Group, authorize
 }
 
 // authenticate gets an authorization token to allow clients to access Azure assets.
-func authenticate(tenantID string) (autorest.Authorizer, error) {
+func authenticate(tenantID uuid.UUID) (autorest.Authorizer, error) {
 	authClient := autorest.NewClientWithUserAgent("github.com/Azure-Samples/arm-compute-go-vm-extensions")
 	var deviceCode *azure.DeviceCode
 	var token *azure.Token
 	var config *azure.OAuthConfig
 
-	if temp, err := environment.OAuthConfigForTenant(tenantID); err == nil {
+	if temp, err := environment.OAuthConfigForTenant(tenantID.String()); err == nil {
 		config = temp
 	} else {
 		return nil, err
