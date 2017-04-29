@@ -246,7 +246,15 @@ func setupKeyVault(subscriptionID string, group resources.Group, tenant uuid.UUI
 		created, err := client.CreateOrUpdate(*group.Name, vaultName, keyvault.VaultCreateOrUpdateParameters{
 			Location: group.Location,
 			Properties: &keyvault.VaultProperties{
-				AccessPolicies:           &[]keyvault.AccessPolicyEntry{},
+				AccessPolicies: &[]keyvault.AccessPolicyEntry{
+					{
+						TenantID: &tenant,
+						Permissions: &keyvault.Permissions{
+							Keys:    &[]keyvault.KeyPermissions{keyvault.KeyPermissionsAll},
+							Secrets: &[]keyvault.SecretPermissions{keyvault.SecretPermissionsAll},
+						},
+					},
+				},
 				EnabledForDiskEncryption: to.BoolPtr(true),
 				Sku: &keyvault.Sku{
 					Family: to.StringPtr("A"),
