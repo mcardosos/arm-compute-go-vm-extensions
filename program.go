@@ -23,7 +23,8 @@ import (
 )
 
 var (
-	userSubscriptionID string
+	userClientID       uuid.UUID
+	userSubscriptionID uuid.UUID
 	userTenantID       uuid.UUID
 	environment        = azure.PublicCloud
 )
@@ -36,7 +37,6 @@ var (
 )
 
 const (
-	clientID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46" // This is the client ID for the Azure CLI. It was chosen for its public well-known status.
 	location = "WESTUS2"
 )
 
@@ -48,7 +48,7 @@ func main() {
 	var sampleOSDisk, sampleDataDisk disk.Model
 	var sampleVault keyvault.Vault
 
-	var authorizer autorest.Authorizer
+	var authorizer *azure.Token
 	exitStatus := 1
 	defer func() {
 		os.Exit(exitStatus)
@@ -58,7 +58,7 @@ func main() {
 	debugLog.Println("Using Tenant ID: ", userTenantID)
 
 	// Get authenticated so we can access the subscription used to run this sample.
-	if temp, err := authenticate(userTenantID); err == nil {
+	if temp, err := authenticate(userClientID, userTenantID); err == nil {
 		authorizer = temp
 	} else {
 		errLog.Printf("could not authenticate. Error: %v", err)
@@ -85,7 +85,7 @@ func main() {
 	// Create Pre-requisites for a VM. Because they are independent, we can do so in parallel.
 	storageAccountResults, storageAccountErrs := setupStorageAccount(userSubscriptionID, group, authorizer)
 	virtualNetworkResults, virtualNetworkErrs := setupVirtualNetwork(userSubscriptionID, group, authorizer)
-	vaultResults, vaultErrs := setupKeyVault(userSubscriptionID, group, userTenantID, authorizer)
+	vaultResults, vaultErrs := setupKeyVault(userClientID, userSubscriptionID, userTenantID, group, authorizer)
 
 	select {
 	case sampleNetwork = <-virtualNetworkResults:
@@ -111,8 +111,8 @@ func main() {
 	}
 	statusLog.Print("Created Key Vault: ", *sampleVault.Name)
 
-	osDiskResults, osDiskErrs := setupManagedDisk(userSubscriptionID, group, sampleStorageAccount, sampleVault, authorizer)
-	dataDiskResults, dataDiskErrs := setupManagedDisk(userSubscriptionID, group, sampleStorageAccount, sampleVault, authorizer)
+	osDiskResults, osDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, authorizer)
+	dataDiskResults, dataDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, authorizer)
 
 	select {
 	case sampleOSDisk = <-osDiskResults:
@@ -158,7 +158,7 @@ func main() {
 		return
 	}
 
-	vmClient := compute.NewVirtualMachinesClient(userSubscriptionID)
+	vmClient := compute.NewVirtualMachinesClient(userSubscriptionID.String())
 	vmClient.Authorizer = authorizer
 
 	exitStatus = 0
@@ -168,7 +168,7 @@ func init() {
 	var badArgs bool
 
 	errLog = log.New(os.Stderr, "[ERROR] ", 0)
-	statusLog = log.New(os.Stdout, "[STATUS] ", 0)
+	statusLog = log.New(os.Stdout, "[STATUS] ", log.Ltime)
 
 	unformattedSubscriptionID := flag.String("subscription", os.Getenv("AZURE_SUBSCRIPTION_ID"), "The subscription that will be targeted when running this sample.")
 	unformattedTenantID := flag.String("tenant", os.Getenv("AZURE_TENANT_ID"), "The tenant that hosts the subscription to be used by this sample.")
@@ -187,8 +187,9 @@ func init() {
 		return retval
 	}
 
-	userSubscriptionID = ensureUUID("Subscription ID", *unformattedSubscriptionID).String()
+	userSubscriptionID = ensureUUID("Subscription ID", *unformattedSubscriptionID)
 	userTenantID = ensureUUID("Tenant ID", *unformattedTenantID)
+	userClientID = ensureUUID("Client ID", "04b07795-8ddb-461a-bbee-02f9e1bf7b46") // This is the client ID for the Azure CLI. It was chosen for its public well-known status.
 
 	var debugWriter io.Writer
 	if *printDebug {
@@ -203,8 +204,8 @@ func init() {
 	}
 }
 
-func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (created resources.Group, deleter func(), err error) {
-	resourceClient := resources.NewGroupsClient(subscriptionID)
+func setupResourceGroup(subscriptionID uuid.UUID, authorizer autorest.Authorizer) (created resources.Group, deleter func(), err error) {
+	resourceClient := resources.NewGroupsClient(subscriptionID.String())
 	resourceClient.Authorizer = authorizer
 
 	name := fmt.Sprintf("sample-rg%s", uuid.NewV4().String())
@@ -228,14 +229,14 @@ func setupResourceGroup(subscriptionID string, authorizer autorest.Authorizer) (
 }
 
 // setupKeyVault creates a secure location to hold the secrets for encrypting and unencrypting the VM created in this sample's OS and Data disks.
-func setupKeyVault(subscriptionID string, group resources.Group, tenant uuid.UUID, authorizer autorest.Authorizer) (<-chan keyvault.Vault, <-chan error) {
+func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (<-chan keyvault.Vault, <-chan error) {
 	results, errs := make(chan keyvault.Vault), make(chan error)
 
 	go func() {
 		defer close(results)
 		defer close(errs)
 
-		client := keyvault.NewVaultsClient(subscriptionID)
+		client := keyvault.NewVaultsClient(subscriptionID.String())
 		client.Authorizer = authorizer
 
 		vaultName := uuid.NewV4().String()
@@ -248,7 +249,8 @@ func setupKeyVault(subscriptionID string, group resources.Group, tenant uuid.UUI
 			Properties: &keyvault.VaultProperties{
 				AccessPolicies: &[]keyvault.AccessPolicyEntry{
 					{
-						TenantID: &tenant,
+						ObjectID: to.StringPtr(clientID.String()),
+						TenantID: &tenantID,
 						Permissions: &keyvault.Permissions{
 							Keys:    &[]keyvault.KeyPermissions{keyvault.KeyPermissionsAll},
 							Secrets: &[]keyvault.SecretPermissions{keyvault.SecretPermissionsAll},
@@ -260,7 +262,7 @@ func setupKeyVault(subscriptionID string, group resources.Group, tenant uuid.UUI
 					Family: to.StringPtr("A"),
 					Name:   keyvault.Standard,
 				},
-				TenantID: &tenant,
+				TenantID: &tenantID,
 			},
 		})
 
@@ -275,31 +277,56 @@ func setupKeyVault(subscriptionID string, group resources.Group, tenant uuid.UUI
 	return results, errs
 }
 
-func setupManagedDisk(subscriptionID string, group resources.Group, account storage.Account, vault keyvault.Vault, authorizer autorest.Authorizer) (<-chan disk.Model, <-chan error) {
+func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer azure.Token, vault keyvault.Vault) (key keys.KeyBundle, err error) {
+	var oAuthConfig *azure.OAuthConfig
+	var spt *azure.ServicePrincipalToken
+
+	oAuthConfig, err = environment.OAuthConfigForTenant(tenantID.String())
+	if err != nil {
+		return
+	}
+
+	spt, err = azure.NewServicePrincipalTokenFromManualToken(*oAuthConfig, clientID.String(), environment.KeyVaultEndpoint, authorizer)
+	if err != nil {
+		return
+	}
+
+	client := keys.New()
+	client.Authorizer = spt
+
+	keyName := "key-" + uuid.NewV4().String()
+
+	key, err = client.CreateKey(fmt.Sprintf("https://%s.vault.azure.net", *vault.Name), keyName, keys.KeyCreateParameters{
+		KeyAttributes: &keys.KeyAttributes{
+			Enabled: to.BoolPtr(true),
+		},
+		KeySize: to.Int32Ptr(1024),
+		KeyOps: &[]keys.JSONWebKeyOperation{
+			keys.Encrypt,
+			keys.Decrypt,
+		},
+		Kty: keys.RSA,
+	})
+
+	statusLog.Print("Encryption key created: ", keyName)
+
+	return
+}
+
+func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, account storage.Account, vault keyvault.Vault, authorizer *azure.Token) (<-chan disk.Model, <-chan error) {
 	results, errs := make(chan disk.Model), make(chan error)
 
 	go func() {
-		diskClient := disk.NewDisksClient(subscriptionID)
-		diskClient.Authorizer = authorizer
+		var key keys.KeyBundle
+		var err error
 
-		vaultClient := keys.New()
-		vaultClient.Authorizer = authorizer
+		diskClient := disk.NewDisksClient(subscriptionID.String())
+		diskClient.Authorizer = authorizer
 
 		diskName := "disk-" + uuid.NewV4().String()
 
-		key, err := vaultClient.CreateKey(fmt.Sprintf("https://%s.vault.azure.net", *vault.Name), "key-"+diskName, keys.KeyCreateParameters{
-			KeyAttributes: &keys.KeyAttributes{
-				Enabled: to.BoolPtr(true),
-			},
-			KeySize: to.Int32Ptr(1024),
-			KeyOps: &[]keys.JSONWebKeyOperation{
-				keys.Encrypt,
-				keys.Decrypt,
-			},
-			Kty: keys.RSA,
-		})
+		key, err = setupEncryptionKey(clientID, tenantID, *authorizer, vault)
 		if err != nil {
-			errs <- err
 			return
 		}
 
@@ -339,10 +366,10 @@ func setupManagedDisk(subscriptionID string, group resources.Group, account stor
 	return results, errs
 }
 
-func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, storageAccount storage.Account, osDisk compute.OSDisk, dataDisks []compute.DataDisk, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
+func setupVirtualMachine(subscriptionID uuid.UUID, resourceGroup resources.Group, storageAccount storage.Account, osDisk compute.OSDisk, dataDisks []compute.DataDisk, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
 	var networkCard network.Interface
 
-	client := compute.NewVirtualMachinesClient(subscriptionID)
+	client := compute.NewVirtualMachinesClient(subscriptionID.String())
 	client.Authorizer = authorizer
 
 	vmName := fmt.Sprintf("sample-vm%s", uuid.NewV4().String())
@@ -400,7 +427,7 @@ func setupVirtualMachine(subscriptionID string, resourceGroup resources.Group, s
 	return
 }
 
-func setupVirtualNetwork(subscriptionID string, resourceGroup resources.Group, authorizer autorest.Authorizer) (<-chan network.VirtualNetwork, <-chan error) {
+func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group, authorizer autorest.Authorizer) (<-chan network.VirtualNetwork, <-chan error) {
 	results, errs := make(chan network.VirtualNetwork), make(chan error)
 
 	go func() {
@@ -409,7 +436,7 @@ func setupVirtualNetwork(subscriptionID string, resourceGroup resources.Group, a
 
 		var err error
 
-		networkClient := network.NewVirtualNetworksClient(subscriptionID)
+		networkClient := network.NewVirtualNetworksClient(subscriptionID.String())
 		networkClient.Authorizer = authorizer
 
 		const networkName = "sampleNetwork"
@@ -429,7 +456,7 @@ func setupVirtualNetwork(subscriptionID string, resourceGroup resources.Group, a
 			return
 		}
 
-		subnetClient := network.NewSubnetsClient(subscriptionID)
+		subnetClient := network.NewSubnetsClient(subscriptionID.String())
 		subnetClient.Authorizer = authorizer
 
 		const subnetName = "sampleSubnet"
@@ -456,8 +483,8 @@ func setupVirtualNetwork(subscriptionID string, resourceGroup resources.Group, a
 	return results, errs
 }
 
-func setupNetworkInterface(subscriptionID string, resourceGroup resources.Group, subnet network.Subnet, machine network.SubResource, authorizer autorest.Authorizer) (created network.Interface, err error) {
-	client := network.NewInterfacesClient(subscriptionID)
+func setupNetworkInterface(subscriptionID uuid.UUID, resourceGroup resources.Group, subnet network.Subnet, machine network.SubResource, authorizer autorest.Authorizer) (created network.Interface, err error) {
+	client := network.NewInterfacesClient(subscriptionID.String())
 	client.Authorizer = authorizer
 
 	var ip network.PublicIPAddress
@@ -513,8 +540,8 @@ func setupNetworkSecurityGroup(subscriptionID, resourceGroupName string, authori
 	return
 }
 
-func setupPublicIP(subscriptionID string, group resources.Group, authorizer autorest.Authorizer) (created network.PublicIPAddress, err error) {
-	client := network.NewPublicIPAddressesClient(subscriptionID)
+func setupPublicIP(subscriptionID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (created network.PublicIPAddress, err error) {
+	client := network.NewPublicIPAddressesClient(subscriptionID.String())
 	client.Authorizer = authorizer
 
 	name := "sample-publicip"
@@ -533,14 +560,14 @@ func setupPublicIP(subscriptionID string, group resources.Group, authorizer auto
 	return
 }
 
-func setupStorageAccount(subscriptionID string, group resources.Group, authorizer autorest.Authorizer) (<-chan storage.Account, <-chan error) {
+func setupStorageAccount(subscriptionID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (<-chan storage.Account, <-chan error) {
 	results, errs := make(chan storage.Account), make(chan error)
 
 	go func() {
 		defer close(errs)
 		defer close(results)
 
-		client := storage.NewAccountsClient(subscriptionID)
+		client := storage.NewAccountsClient(subscriptionID.String())
 		client.Authorizer = authorizer
 
 		storageAccountName := "sample"
@@ -571,7 +598,7 @@ func setupStorageAccount(subscriptionID string, group resources.Group, authorize
 }
 
 // authenticate gets an authorization token to allow clients to access Azure assets.
-func authenticate(tenantID uuid.UUID) (autorest.Authorizer, error) {
+func authenticate(clientID, tenantID uuid.UUID) (*azure.Token, error) {
 	authClient := autorest.NewClientWithUserAgent("github.com/Azure-Samples/arm-compute-go-vm-extensions")
 	var deviceCode *azure.DeviceCode
 	var token *azure.Token
@@ -584,7 +611,7 @@ func authenticate(tenantID uuid.UUID) (autorest.Authorizer, error) {
 	}
 
 	debugLog.Print("DeviceCodeEndpoint: ", config.DeviceCodeEndpoint.String())
-	if temp, err := azure.InitiateDeviceAuth(&authClient, *config, clientID, environment.ServiceManagementEndpoint); err == nil {
+	if temp, err := azure.InitiateDeviceAuth(&authClient, *config, clientID.String(), environment.ServiceManagementEndpoint); err == nil {
 		deviceCode = temp
 	} else {
 		return nil, err
