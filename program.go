@@ -229,7 +229,7 @@ func setupResourceGroup(subscriptionID uuid.UUID, authorizer autorest.Authorizer
 }
 
 // setupKeyVault creates a secure location to hold the secrets for encrypting and unencrypting the VM created in this sample's OS and Data disks.
-func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (<-chan keyvault.Vault, <-chan error) {
+func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, authorizer *azure.Token) (<-chan keyvault.Vault, <-chan error) {
 	results, errs := make(chan keyvault.Vault), make(chan error)
 
 	go func() {
@@ -249,7 +249,7 @@ func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources
 			Properties: &keyvault.VaultProperties{
 				AccessPolicies: &[]keyvault.AccessPolicyEntry{
 					{
-						ObjectID: to.StringPtr(clientID.String()),
+						ObjectID: to.StringPtr("INSERT YOUR GRAPHRBAC OBJECT ID HERE"),
 						TenantID: &tenantID,
 						Permissions: &keyvault.Permissions{
 							Keys:    &[]keyvault.KeyPermissions{keyvault.KeyPermissionsAll},
@@ -257,7 +257,9 @@ func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources
 						},
 					},
 				},
-				EnabledForDiskEncryption: to.BoolPtr(true),
+				EnabledForDiskEncryption:     to.BoolPtr(true),
+				EnabledForDeployment:         to.BoolPtr(true),
+				EnabledForTemplateDeployment: to.BoolPtr(true),
 				Sku: &keyvault.Sku{
 					Family: to.StringPtr("A"),
 					Name:   keyvault.Standard,
@@ -320,6 +322,9 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 		var key keys.KeyBundle
 		var err error
 
+		defer close(errs)
+		defer close(results)
+
 		diskClient := disk.NewDisksClient(subscriptionID.String())
 		diskClient.Authorizer = authorizer
 
@@ -327,6 +332,7 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 
 		key, err = setupEncryptionKey(clientID, tenantID, *authorizer, vault)
 		if err != nil {
+			errs <- err
 			return
 		}
 
