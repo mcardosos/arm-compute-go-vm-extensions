@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net/url"
 	"os"
 	"strings"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/arm/storage"
 	keys "github.com/Azure/azure-sdk-for-go/dataplane/keyvault"
 	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/satori/uuid"
@@ -48,7 +50,8 @@ func main() {
 	var sampleOSDisk, sampleDataDisk disk.Model
 	var sampleVault keyvault.Vault
 
-	var authorizer *azure.Token
+	var token *adal.Token
+	var authorizer *autorest.BearerAuthorizer
 	exitStatus := 1
 	defer func() {
 		os.Exit(exitStatus)
@@ -59,7 +62,8 @@ func main() {
 
 	// Get authenticated so we can access the subscription used to run this sample.
 	if temp, err := authenticate(userClientID, userTenantID); err == nil {
-		authorizer = temp
+		token = temp
+		authorizer = autorest.NewBearerAuthorizer(token)
 	} else {
 		errLog.Printf("could not authenticate. Error: %v", err)
 		return
@@ -111,8 +115,8 @@ func main() {
 	}
 	statusLog.Print("Created Key Vault: ", *sampleVault.Name)
 
-	osDiskResults, osDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, authorizer)
-	dataDiskResults, dataDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, authorizer)
+	osDiskResults, osDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, token)
+	dataDiskResults, dataDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, token)
 
 	select {
 	case sampleOSDisk = <-osDiskResults:
@@ -229,7 +233,7 @@ func setupResourceGroup(subscriptionID uuid.UUID, authorizer autorest.Authorizer
 }
 
 // setupKeyVault creates a secure location to hold the secrets for encrypting and unencrypting the VM created in this sample's OS and Data disks.
-func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, authorizer *azure.Token) (<-chan keyvault.Vault, <-chan error) {
+func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (<-chan keyvault.Vault, <-chan error) {
 	results, errs := make(chan keyvault.Vault), make(chan error)
 
 	go func() {
@@ -279,30 +283,44 @@ func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources
 	return results, errs
 }
 
-func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer azure.Token, vault keyvault.Vault) (key keys.KeyBundle, err error) {
-	var oAuthConfig *azure.OAuthConfig
-	var spt *azure.ServicePrincipalToken
+func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer adal.Token, vault keyvault.Vault) (key keys.KeyBundle, err error) {
+	var oAuthConfig *adal.OAuthConfig
+	var spt *adal.ServicePrincipalToken
 
-	oAuthConfig, err = environment.OAuthConfigForTenant(tenantID.String())
+	oAuthConfig, err = adal.NewOAuthConfig(environment.ActiveDirectoryEndpoint, tenantID.String())
 	if err != nil {
 		return
 	}
 
-	spt, err = azure.NewServicePrincipalTokenFromManualToken(*oAuthConfig, clientID.String(), environment.KeyVaultEndpoint, authorizer)
+	var updatedAuthorizeEndpoint *url.URL
+	updatedAuthorizeEndpoint, err = url.Parse("https://login.windows.net/" + tenantID.String() + "/oauth2/token")
+	oAuthConfig.AuthorizeEndpoint = *updatedAuthorizeEndpoint
+	if err != nil {
+		return
+	}
+
+	vaultURL := fmt.Sprintf("https://%s.vault.azure.net/", *vault.Name)
+
+	spt, err = adal.NewServicePrincipalTokenFromManualToken(*oAuthConfig, clientID.String(), "https://vault.azure.net", authorizer)
+	if err != nil {
+		return
+	}
+
+	err = spt.Refresh()
 	if err != nil {
 		return
 	}
 
 	client := keys.New()
-	client.Authorizer = spt
+	client.Authorizer = autorest.NewBearerAuthorizer(spt)
 
 	keyName := "key-" + uuid.NewV4().String()
 
-	key, err = client.CreateKey(fmt.Sprintf("https://%s.vault.azure.net", *vault.Name), keyName, keys.KeyCreateParameters{
+	key, err = client.CreateKey(vaultURL, keyName, keys.KeyCreateParameters{
 		KeyAttributes: &keys.KeyAttributes{
 			Enabled: to.BoolPtr(true),
 		},
-		KeySize: to.Int32Ptr(1024),
+		KeySize: to.Int32Ptr(2048),
 		KeyOps: &[]keys.JSONWebKeyOperation{
 			keys.Encrypt,
 			keys.Decrypt,
@@ -310,12 +328,10 @@ func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer azure.Token, va
 		Kty: keys.RSA,
 	})
 
-	statusLog.Print("Encryption key created: ", keyName)
-
 	return
 }
 
-func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, account storage.Account, vault keyvault.Vault, authorizer *azure.Token) (<-chan disk.Model, <-chan error) {
+func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, account storage.Account, vault keyvault.Vault, authorizer *adal.Token) (<-chan disk.Model, <-chan error) {
 	results, errs := make(chan disk.Model), make(chan error)
 
 	go func() {
@@ -326,21 +342,24 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 		defer close(results)
 
 		diskClient := disk.NewDisksClient(subscriptionID.String())
-		diskClient.Authorizer = authorizer
+		diskClient.Authorizer = autorest.NewBearerAuthorizer(authorizer)
 
 		diskName := "disk-" + uuid.NewV4().String()
 
 		key, err = setupEncryptionKey(clientID, tenantID, *authorizer, vault)
 		if err != nil {
+			debugLog.Print("Encryption key err: ", err.Error())
 			errs <- err
 			return
 		}
+		statusLog.Print("Encryption Key Created")
 
 		keyURL, err := key.Location()
 		if err != nil {
 			errs <- err
 			return
 		}
+		statusLog.Print("Key Location Identified")
 
 		_, err = diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
 			Location: group.Location,
@@ -604,20 +623,20 @@ func setupStorageAccount(subscriptionID uuid.UUID, group resources.Group, author
 }
 
 // authenticate gets an authorization token to allow clients to access Azure assets.
-func authenticate(clientID, tenantID uuid.UUID) (*azure.Token, error) {
+func authenticate(clientID, tenantID uuid.UUID) (*adal.Token, error) {
 	authClient := autorest.NewClientWithUserAgent("github.com/Azure-Samples/arm-compute-go-vm-extensions")
-	var deviceCode *azure.DeviceCode
-	var token *azure.Token
-	var config *azure.OAuthConfig
+	var deviceCode *adal.DeviceCode
+	var token *adal.Token
+	var config *adal.OAuthConfig
 
-	if temp, err := environment.OAuthConfigForTenant(tenantID.String()); err == nil {
+	if temp, err := adal.NewOAuthConfig(environment.ActiveDirectoryEndpoint, tenantID.String()); err == nil {
 		config = temp
 	} else {
 		return nil, err
 	}
 
 	debugLog.Print("DeviceCodeEndpoint: ", config.DeviceCodeEndpoint.String())
-	if temp, err := azure.InitiateDeviceAuth(&authClient, *config, clientID.String(), environment.ServiceManagementEndpoint); err == nil {
+	if temp, err := adal.InitiateDeviceAuth(&authClient, *config, clientID.String(), environment.ServiceManagementEndpoint); err == nil {
 		deviceCode = temp
 	} else {
 		return nil, err
@@ -627,11 +646,13 @@ func authenticate(clientID, tenantID uuid.UUID) (*azure.Token, error) {
 		return nil, err
 	}
 
-	if temp, err := azure.WaitForUserCompletion(&authClient, deviceCode); err == nil {
+	if temp, err := adal.WaitForUserCompletion(&authClient, deviceCode); err == nil {
 		token = temp
 	} else {
 		return nil, err
 	}
+
+	debugLog.Printf("Retreived token: %v", *token)
 
 	return token, nil
 }
