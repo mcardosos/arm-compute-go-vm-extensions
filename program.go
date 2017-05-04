@@ -283,6 +283,12 @@ func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources
 	return results, errs
 }
 
+func setupEncryptionSecret(clientID, tenantID uuid.UUID, authorizer adal.Token, vault keyvault.Vault) (secret keys.SecretBundle, err error) {
+	client := keys.New()
+
+	uuid.NewV4()
+}
+
 func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer adal.Token, vault keyvault.Vault) (key keys.KeyBundle, err error) {
 	var oAuthConfig *adal.OAuthConfig
 	var spt *adal.ServicePrincipalToken
@@ -352,14 +358,7 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 			errs <- err
 			return
 		}
-		statusLog.Print("Encryption Key Created")
-
-		keyURL, err := key.Location()
-		if err != nil {
-			errs <- err
-			return
-		}
-		statusLog.Print("Key Location Identified")
+		statusLog.Print("Encryption Key Created: ", *key.Key.Kid)
 
 		_, err = diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
 			Location: group.Location,
@@ -371,7 +370,12 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 				EncryptionSettings: &disk.EncryptionSettings{
 					Enabled: to.BoolPtr(true),
 					KeyEncryptionKey: &disk.KeyVaultAndKeyReference{
-						KeyURL: to.StringPtr(keyURL.String()),
+						KeyURL: key.Key.Kid,
+						SourceVault: &disk.SourceVault{
+							ID: vault.ID,
+						},
+					},
+					DiskEncryptionKey: &disk.KeyVaultAndSecretReference{
 						SourceVault: &disk.SourceVault{
 							ID: vault.ID,
 						},
