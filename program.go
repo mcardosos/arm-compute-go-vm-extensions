@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"bytes"
 
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
 	"github.com/Azure/azure-sdk-for-go/arm/disk"
@@ -79,7 +82,9 @@ func main() {
 				fmt.Scanln()
 			}
 			statusLog.Print("Deleting Resource Group: ", *group.Name)
-			deleter()
+			if deleted := <-deleter(); deleted != nil {
+				errLog.Print(deleted)
+			}
 		}()
 	} else {
 		errLog.Printf("could not create resource group. Error: %v", err)
@@ -91,47 +96,45 @@ func main() {
 	virtualNetworkResults, virtualNetworkErrs := setupVirtualNetwork(userSubscriptionID, group, authorizer)
 	vaultResults, vaultErrs := setupKeyVault(userClientID, userSubscriptionID, userTenantID, group, authorizer)
 
-	select {
-	case sampleNetwork = <-virtualNetworkResults:
-	case err := <-virtualNetworkErrs:
+	sampleNetwork = <-virtualNetworkResults
+	if err := <-virtualNetworkErrs; err != nil {
 		errLog.Print(err)
 		return
 	}
+	debugLog.Print("Sample Network: ", sampleNetwork)
 	statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
 
-	select {
-	case sampleStorageAccount = <-storageAccountResults:
-	case err := <-storageAccountErrs:
+	sampleStorageAccount = <-storageAccountResults
+	if err := <-storageAccountErrs; err != nil {
 		errLog.Print(err)
 		return
 	}
+	debugLog.Print("Sample Storage Account: ", sampleStorageAccount)
 	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
 
-	select {
-	case sampleVault = <-vaultResults:
-	case err := <-vaultErrs:
+	sampleVault = <-vaultResults
+	if err := <-vaultErrs; err != nil {
 		errLog.Print(err)
 		return
 	}
+	debugLog.Print("Sample Vault: ", sampleVault)
 	statusLog.Print("Created Key Vault: ", *sampleVault.Name)
 
 	osDiskResults, osDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, token)
 	dataDiskResults, dataDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, token)
 
-	select {
-	case sampleOSDisk = <-osDiskResults:
-	case err := <-osDiskErrs:
+	if err := <-osDiskErrs; err != nil {
 		errLog.Print(err)
 		return
 	}
+	sampleOSDisk = <-osDiskResults
 	statusLog.Print("Created OS Disk: ", *sampleOSDisk.Name)
 
-	select {
-	case sampleDataDisk = <-dataDiskResults:
-	case err := <-dataDiskErrs:
+	if err := <-dataDiskErrs; err != nil {
 		errLog.Print(err)
 		return
 	}
+	sampleDataDisk = <-dataDiskResults
 	statusLog.Print("Created Data Disk: ", *sampleDataDisk.Name)
 
 	dataDisks := []compute.DataDisk{
@@ -208,7 +211,7 @@ func init() {
 	}
 }
 
-func setupResourceGroup(subscriptionID uuid.UUID, authorizer autorest.Authorizer) (created resources.Group, deleter func(), err error) {
+func setupResourceGroup(subscriptionID uuid.UUID, authorizer autorest.Authorizer) (created resources.Group, deleter func() <-chan error, err error) {
 	resourceClient := resources.NewGroupsClient(subscriptionID.String())
 	resourceClient.Authorizer = authorizer
 
@@ -219,14 +222,16 @@ func setupResourceGroup(subscriptionID uuid.UUID, authorizer autorest.Authorizer
 	})
 
 	if err == nil {
-		deleter = func() {
-			_, err = resourceClient.Delete(*created.Name, nil)
-			if err == nil {
-				return
-			}
+		deleter = func() <-chan error {
+			_, result := resourceClient.Delete(*created.Name, nil)
+			return result
 		}
 	} else {
-		deleter = func() {}
+		deleter = func() <-chan error {
+			result := make(chan error)
+			close(result)
+			return result
+		}
 	}
 
 	return
@@ -283,12 +288,6 @@ func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources
 	return results, errs
 }
 
-func setupEncryptionSecret(clientID, tenantID uuid.UUID, authorizer adal.Token, vault keyvault.Vault) (secret keys.SecretBundle, err error) {
-	client := keys.New()
-
-	uuid.NewV4()
-}
-
 func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer adal.Token, vault keyvault.Vault) (key keys.KeyBundle, err error) {
 	var oAuthConfig *adal.OAuthConfig
 	var spt *adal.ServicePrincipalToken
@@ -326,7 +325,7 @@ func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer adal.Token, vau
 		KeyAttributes: &keys.KeyAttributes{
 			Enabled: to.BoolPtr(true),
 		},
-		KeySize: to.Int32Ptr(2048),
+		KeySize: to.Int32Ptr(2048), // As of writing this sample, 2048 is the only supported KeySize.
 		KeyOps: &[]keys.JSONWebKeyOperation{
 			keys.Encrypt,
 			keys.Decrypt,
@@ -337,62 +336,62 @@ func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer adal.Token, vau
 	return
 }
 
+func setupEncryptionSecret(clientID, tenantID uuid.UUID, authorizer adal.Token, vault keyvault.Vault) (secret keys.SecretBundle, err error) {
+	err = errors.New("not implemented")
+	return
+}
+
 func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, account storage.Account, vault keyvault.Vault, authorizer *adal.Token) (<-chan disk.Model, <-chan error) {
+	var key keys.KeyBundle
+	var secret keys.SecretBundle
 	results, errs := make(chan disk.Model), make(chan error)
+	defer close(results)
+	defer close(errs)
 
-	go func() {
-		var key keys.KeyBundle
-		var err error
+	diskClient := disk.NewDisksClient(subscriptionID.String())
+	diskClient.Authorizer = autorest.NewBearerAuthorizer(authorizer)
 
-		defer close(errs)
-		defer close(results)
+	diskName := "disk-" + uuid.NewV4().String()
 
-		diskClient := disk.NewDisksClient(subscriptionID.String())
-		diskClient.Authorizer = autorest.NewBearerAuthorizer(authorizer)
+	var err error
 
-		diskName := "disk-" + uuid.NewV4().String()
+	key, err = setupEncryptionKey(clientID, tenantID, *authorizer, vault)
+	if err != nil {
+		errs <- err
+		return results, errs
+	}
+	statusLog.Print("Encryption Key Created: ", *key.Key.Kid)
 
-		key, err = setupEncryptionKey(clientID, tenantID, *authorizer, vault)
-		if err != nil {
-			debugLog.Print("Encryption key err: ", err.Error())
-			errs <- err
-			return
-		}
-		statusLog.Print("Encryption Key Created: ", *key.Key.Kid)
+	secret, err = setupEncryptionSecret(clientID, tenantID, *authorizer, vault)
+	if err != nil {
+		errs <- err
+		return results, errs
+	}
 
-		_, err = diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
-			Location: group.Location,
-			Properties: &disk.Properties{
-				CreationData: &disk.CreationData{
-					CreateOption: disk.Empty,
-				},
-				DiskSizeGB: to.Int32Ptr(64),
-				EncryptionSettings: &disk.EncryptionSettings{
-					Enabled: to.BoolPtr(true),
-					KeyEncryptionKey: &disk.KeyVaultAndKeyReference{
-						KeyURL: key.Key.Kid,
-						SourceVault: &disk.SourceVault{
-							ID: vault.ID,
-						},
+	return diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
+		Location: group.Location,
+		Properties: &disk.Properties{
+			CreationData: &disk.CreationData{
+				CreateOption: disk.Empty,
+			},
+			DiskSizeGB: to.Int32Ptr(64),
+			EncryptionSettings: &disk.EncryptionSettings{
+				Enabled: to.BoolPtr(true),
+				KeyEncryptionKey: &disk.KeyVaultAndKeyReference{
+					KeyURL: key.Key.Kid,
+					SourceVault: &disk.SourceVault{
+						ID: vault.ID,
 					},
-					DiskEncryptionKey: &disk.KeyVaultAndSecretReference{
-						SourceVault: &disk.SourceVault{
-							ID: vault.ID,
-						},
+				},
+				DiskEncryptionKey: &disk.KeyVaultAndSecretReference{
+					SecretURL: secret.Kid,
+					SourceVault: &disk.SourceVault{
+						ID: vault.ID,
 					},
 				},
 			},
-		}, nil)
-		if err != nil {
-			errs <- err
-			return
-		}
-
-		created, err := diskClient.Get(*group.Name, diskName)
-		results <- created
-	}()
-
-	return results, errs
+		},
+	}, nil)
 }
 
 func setupVirtualMachine(subscriptionID uuid.UUID, resourceGroup resources.Group, storageAccount storage.Account, osDisk compute.OSDisk, dataDisks []compute.DataDisk, subnet network.Subnet, authorizer autorest.Authorizer, cancel <-chan struct{}) (created compute.VirtualMachine, err error) {
@@ -411,7 +410,7 @@ func setupVirtualMachine(subscriptionID uuid.UUID, resourceGroup resources.Group
 
 	debugLog.Print("NIC ID: ", *networkCard.ID)
 
-	if _, err = client.CreateOrUpdate(*resourceGroup.Name, vmName, compute.VirtualMachine{
+	results, errs := client.CreateOrUpdate(*resourceGroup.Name, vmName, compute.VirtualMachine{
 		Location: resourceGroup.Location,
 		VirtualMachineProperties: &compute.VirtualMachineProperties{
 			HardwareProfile: &compute.HardwareProfile{
@@ -446,13 +445,9 @@ func setupVirtualMachine(subscriptionID uuid.UUID, resourceGroup resources.Group
 				DataDisks: &dataDisks,
 			},
 		},
-	}, cancel); err == nil {
-		created, err = client.Get(*resourceGroup.Name, vmName, compute.InstanceView)
-	}
-
-	if err != nil {
-		return
-	}
+	}, cancel)
+	err = <-errs
+	created = <-results
 	return
 }
 
@@ -463,6 +458,8 @@ func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group
 		defer close(errs)
 		defer close(results)
 
+		var tempErrs <-chan error
+		var created network.VirtualNetwork
 		var err error
 
 		networkClient := network.NewVirtualNetworksClient(subscriptionID.String())
@@ -470,7 +467,7 @@ func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group
 
 		const networkName = "sampleNetwork"
 
-		_, err = networkClient.CreateOrUpdate(*resourceGroup.Name, networkName, network.VirtualNetwork{
+		_, tempErrs = networkClient.CreateOrUpdate(*resourceGroup.Name, networkName, network.VirtualNetwork{
 			Location: resourceGroup.Location,
 			VirtualNetworkPropertiesFormat: &network.VirtualNetworkPropertiesFormat{
 				AddressSpace: &network.AddressSpace{
@@ -480,9 +477,30 @@ func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group
 				},
 			},
 		}, nil)
+		if err = <-tempErrs; err != nil {
+			errs <- err
+			return
+		}
+		created, err = networkClient.Get(*resourceGroup.Name, networkName, "")
 		if err != nil {
 			errs <- err
 			return
+		}
+
+		if httpResp := created.Response.Response; httpResp != nil {
+			respText := &bytes.Buffer{}
+			fmt.Fprintln(respText, "Virtual Network Response Headers:")
+			for name, values := range httpResp.Header {
+				fmt.Fprintln(respText, "\t", name)
+				for _, entry := range values {
+					fmt.Fprintln(respText, "\t\t", entry)
+				}
+			}
+			fmt.Fprintln(respText, "Content Length: ", httpResp.ContentLength)
+			fmt.Fprintln(respText, "Status Code: ", httpResp.StatusCode)
+			debugLog.Print(respText)
+		} else {
+			debugLog.Print("Virtual Network Creation Nil")
 		}
 
 		subnetClient := network.NewSubnetsClient(subscriptionID.String())
@@ -490,18 +508,17 @@ func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group
 
 		const subnetName = "sampleSubnet"
 
-		_, err = subnetClient.CreateOrUpdate(*resourceGroup.Name, networkName, "sampleSubnet", network.Subnet{
+		debugLog.Print("At A")
+
+		_, tempErrs = subnetClient.CreateOrUpdate(*resourceGroup.Name, networkName, "sampleSubnet", network.Subnet{
 			SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
 				AddressPrefix: to.StringPtr("192.168.1.0/24"),
 			},
 		}, nil)
-		if err != nil {
-			errs <- err
-			return
-		}
 
-		created, err := networkClient.Get(*resourceGroup.Name, networkName, "")
-		if err != nil {
+		debugLog.Print("At B")
+
+		if err = <-tempErrs; err != nil {
 			errs <- err
 			return
 		}
@@ -527,7 +544,7 @@ func setupNetworkInterface(subscriptionID uuid.UUID, resourceGroup resources.Gro
 
 	name := "sample-networkInterface"
 
-	_, err = client.CreateOrUpdate(*resourceGroup.Name, name, network.Interface{
+	createdInterface, errs := client.CreateOrUpdate(*resourceGroup.Name, name, network.Interface{
 		Location: resourceGroup.Location,
 		InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
 			IPConfigurations: &[]network.InterfaceIPConfiguration{
@@ -543,11 +560,8 @@ func setupNetworkInterface(subscriptionID uuid.UUID, resourceGroup resources.Gro
 			},
 		},
 	}, nil)
-	if err != nil {
-		return
-	}
-
-	created, err = client.Get(*resourceGroup.Name, name, "")
+	created = <-createdInterface
+	err = <-errs
 	return
 }
 
@@ -557,15 +571,11 @@ func setupNetworkSecurityGroup(subscriptionID, resourceGroupName string, authori
 
 	name := "sample-nsg"
 
-	_, err = client.CreateOrUpdate(resourceGroupName, name, network.SecurityGroup{
+	results, errs := client.CreateOrUpdate(resourceGroupName, name, network.SecurityGroup{
 		Location:                      to.StringPtr(location),
 		SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{},
 	}, nil)
-	if err != nil {
-		return
-	}
-
-	created, err = client.Get(resourceGroupName, name, "")
+	created, err = <-results, <-errs
 	return
 }
 
@@ -575,55 +585,31 @@ func setupPublicIP(subscriptionID uuid.UUID, group resources.Group, authorizer a
 
 	name := "sample-publicip"
 
-	_, err = client.CreateOrUpdate(*group.Name, name, network.PublicIPAddress{
+	results, errs := client.CreateOrUpdate(*group.Name, name, network.PublicIPAddress{
 		Location: group.Location,
 		PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
 			PublicIPAllocationMethod: network.Static,
 		},
 	}, nil)
-	if err != nil {
-		return
-	}
-
-	created, err = client.Get(*group.Name, name, "")
+	created, err = <-results, <-errs
 	return
 }
 
 func setupStorageAccount(subscriptionID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (<-chan storage.Account, <-chan error) {
-	results, errs := make(chan storage.Account), make(chan error)
+	client := storage.NewAccountsClient(subscriptionID.String())
+	client.Authorizer = authorizer
 
-	go func() {
-		defer close(errs)
-		defer close(results)
+	storageAccountName := "sample"
+	storageAccountName = storageAccountName + string([]byte(uuid.NewV4().String())[:8])
+	storageAccountName = strings.ToLower(storageAccountName)
+	debugLog.Printf("storageAccountName (length: %d): %s", len(storageAccountName), storageAccountName)
 
-		client := storage.NewAccountsClient(subscriptionID.String())
-		client.Authorizer = authorizer
-
-		storageAccountName := "sample"
-		storageAccountName = storageAccountName + string([]byte(uuid.NewV4().String())[:8])
-		storageAccountName = strings.ToLower(storageAccountName)
-		debugLog.Printf("storageAccountName (length: %d): %s", len(storageAccountName), storageAccountName)
-
-		_, err := client.Create(*group.Name, storageAccountName, storage.AccountCreateParameters{
-			Location: group.Location,
-			Sku: &storage.Sku{
-				Name: storage.StandardLRS,
-			},
-		}, nil)
-		if err != nil {
-			errs <- err
-			return
-		}
-
-		result, err := client.GetProperties(*group.Name, storageAccountName)
-		if err != nil {
-			errs <- err
-			return
-		}
-		results <- result
-	}()
-
-	return results, errs
+	return client.Create(*group.Name, storageAccountName, storage.AccountCreateParameters{
+		Location: group.Location,
+		Sku: &storage.Sku{
+			Name: storage.StandardLRS,
+		},
+	}, nil)
 }
 
 // authenticate gets an authorization token to allow clients to access Azure assets.
@@ -655,8 +641,6 @@ func authenticate(clientID, tenantID uuid.UUID) (*adal.Token, error) {
 	} else {
 		return nil, err
 	}
-
-	debugLog.Printf("Retreived token: %v", *token)
 
 	return token, nil
 }
