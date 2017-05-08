@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -10,10 +11,9 @@ import (
 	"os"
 	"strings"
 
-	"bytes"
-
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
 	"github.com/Azure/azure-sdk-for-go/arm/disk"
+	"github.com/Azure/azure-sdk-for-go/arm/graphrbac"
 	"github.com/Azure/azure-sdk-for-go/arm/keyvault"
 	"github.com/Azure/azure-sdk-for-go/arm/network"
 	"github.com/Azure/azure-sdk-for-go/arm/resources/resources"
@@ -50,10 +50,10 @@ func main() {
 	var sampleNetwork network.VirtualNetwork
 	var sampleStorageAccount storage.Account
 	var sampleVault keyvault.Vault
-
 	var token *adal.Token
 	var authorizer *autorest.BearerAuthorizer
 	var vaultAuthorizer autorest.Authorizer
+	var currentUser graphrbac.AADObject
 	var err error
 
 	exitStatus := 1
@@ -70,6 +70,40 @@ func main() {
 		authorizer = autorest.NewBearerAuthorizer(token)
 	} else {
 		errLog.Printf("could not authenticate. Error: %v", err)
+		return
+	}
+
+	// Get AAD ObjectID of the currently authenticated user to give them and only them access to the Key Vault created below.
+	var stuff *adal.OAuthConfig
+	stuff, err = adal.NewOAuthConfig(environment.ActiveDirectoryEndpoint, userTenantID.String())
+	if err != nil {
+		errLog.Print(err)
+		return
+	}
+	var foo *adal.ServicePrincipalToken
+	foo, err = adal.NewServicePrincipalTokenFromManualToken(*stuff, userClientID.String(), environment.GraphEndpoint, *token)
+	if err != nil {
+		errLog.Print(err)
+		return
+	}
+	err = foo.Refresh()
+	if err != nil {
+		errLog.Print(err)
+		return
+	}
+
+	graphClient := graphrbac.NewObjectsClient(userTenantID.String())
+	graphClient.Authorizer = autorest.NewBearerAuthorizer(foo)
+
+	currentUser, err = graphClient.GetCurrentUser()
+	if err != nil {
+		errLog.Print(err)
+		return
+	}
+	var userID uuid.UUID
+	userID, err = uuid.FromString(*currentUser.ObjectID)
+	if err != nil {
+		errLog.Print(err)
 		return
 	}
 
@@ -95,14 +129,13 @@ func main() {
 	// Create Pre-requisites for a VM. Because they are independent, we can do so in parallel.
 	storageAccountResults, storageAccountErrs := setupStorageAccount(userSubscriptionID, group, authorizer)
 	virtualNetworkResults, virtualNetworkErrs := setupVirtualNetwork(userSubscriptionID, group, authorizer)
-	vaultResults, vaultErrs := setupKeyVault(userClientID, userSubscriptionID, userTenantID, group, authorizer)
+	vaultResults, vaultErrs := setupKeyVault(userID, userSubscriptionID, userTenantID, group, authorizer)
 
 	sampleNetwork = <-virtualNetworkResults
 	if err := <-virtualNetworkErrs; err != nil {
 		errLog.Print(err)
 		return
 	}
-	debugLog.Print("Sample Network: ", sampleNetwork)
 	statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
 
 	sampleStorageAccount = <-storageAccountResults
@@ -110,7 +143,6 @@ func main() {
 		errLog.Print(err)
 		return
 	}
-	debugLog.Print("Sample Storage Account: ", sampleStorageAccount)
 	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
 
 	sampleVault = <-vaultResults
@@ -118,7 +150,6 @@ func main() {
 		errLog.Print(err)
 		return
 	}
-	debugLog.Print("Sample Vault: ", sampleVault)
 	statusLog.Print("Created Key Vault: ", *sampleVault.Name)
 
 	vaultAuthorizer, err = vaultAuthentication(userClientID, userTenantID, *token)
@@ -209,10 +240,13 @@ func setupResourceGroup(subscriptionID uuid.UUID, authorizer autorest.Authorizer
 }
 
 // setupKeyVault creates a secure location to hold the secrets for encrypting and unencrypting the VM created in this sample's OS and Data disks.
-func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (<-chan keyvault.Vault, <-chan error) {
+func setupKeyVault(userID, subscriptionID, tenantID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (<-chan keyvault.Vault, <-chan error) {
 	results, errs := make(chan keyvault.Vault, 1), make(chan error, 1)
 
 	go func() {
+		var err error
+		var created keyvault.Vault
+
 		defer close(results)
 		defer close(errs)
 
@@ -224,12 +258,12 @@ func setupKeyVault(clientID, subscriptionID, tenantID uuid.UUID, group resources
 		vaultName = "vault-" + vaultName
 		vaultName = vaultName[:24]
 
-		created, err := client.CreateOrUpdate(*group.Name, vaultName, keyvault.VaultCreateOrUpdateParameters{
+		created, err = client.CreateOrUpdate(*group.Name, vaultName, keyvault.VaultCreateOrUpdateParameters{
 			Location: group.Location,
 			Properties: &keyvault.VaultProperties{
 				AccessPolicies: &[]keyvault.AccessPolicyEntry{
 					{
-						ObjectID: to.StringPtr("INSERT YOUR GRAPHRBAC OBJECT ID HERE"),
+						ObjectID: to.StringPtr(userID.String()),
 						TenantID: &tenantID,
 						Permissions: &keyvault.Permissions{
 							Keys:    &[]keyvault.KeyPermissions{keyvault.KeyPermissionsAll},
@@ -369,14 +403,11 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 	client.Authorizer = authorizer
 
 	vmName := fmt.Sprintf("sample-vm%s", uuid.NewV4().String())
-	debugLog.Print("VM Name: ", vmName)
 
 	networkCard, err = setupNetworkInterface(subscriptionID, resourceGroup, subnet, network.SubResource{ID: to.StringPtr(vmName)}, authorizer)
 	if err != nil {
 		return
 	}
-
-	debugLog.Print("NIC ID: ", *networkCard.ID)
 
 	var osKey keys.KeyBundle
 	osKey, err = setupEncryptionKey(clientID, tenantID, vaultAuthorizer, vault)
@@ -599,7 +630,6 @@ func setupStorageAccount(subscriptionID uuid.UUID, group resources.Group, author
 	storageAccountName := "sample"
 	storageAccountName = storageAccountName + string([]byte(uuid.NewV4().String())[:8])
 	storageAccountName = strings.ToLower(storageAccountName)
-	debugLog.Printf("storageAccountName (length: %d): %s", len(storageAccountName), storageAccountName)
 
 	return client.Create(*group.Name, storageAccountName, storage.AccountCreateParameters{
 		Location: group.Location,
@@ -622,7 +652,6 @@ func authenticate(clientID, tenantID uuid.UUID) (*adal.Token, error) {
 		return nil, err
 	}
 
-	debugLog.Print("DeviceCodeEndpoint: ", config.DeviceCodeEndpoint.String())
 	if temp, err := adal.InitiateDeviceAuth(&authClient, *config, clientID.String(), environment.ServiceManagementEndpoint); err == nil {
 		deviceCode = temp
 	} else {
@@ -679,18 +708,32 @@ func vaultURL(vault keyvault.Vault) string {
 func formatResponse(resp autorest.Response) string {
 	formatted := &bytes.Buffer{}
 
-	fmt.Fprintln(formatted, "Status Code (", resp.StatusCode, "): ", resp.Status)
+	fmt.Fprintln(formatted, "Request:")
+	fmt.Fprintln(formatted, "\tHeaders:")
 
-	fmt.Fprintln(formatted, "Headers:")
-	for header, values := range resp.Header {
-		fmt.Fprintln(formatted, "\t", header)
+	for header, values := range resp.Request.Header {
+		fmt.Fprintln(formatted, "\t\t", header)
 		for _, val := range values {
-			fmt.Fprintln(formatted, "\t\t", val)
+			fmt.Fprintln(formatted, "\t\t\t", val)
+		}
+	}
+	reqBody, _ := ioutil.ReadAll(resp.Request.Body)
+	fmt.Fprintln(formatted, "\tBody: ", string(reqBody))
+	fmt.Fprintln(formatted, "\tRemote Address: ", resp.Request.RemoteAddr)
+
+	fmt.Fprintln(formatted, "Response:")
+	fmt.Fprintln(formatted, "\tStatus Code: ", resp.Status)
+
+	fmt.Fprintln(formatted, "\tHeaders:")
+	for header, values := range resp.Header {
+		fmt.Fprintln(formatted, "\t\t", header)
+		for _, val := range values {
+			fmt.Fprintln(formatted, "\t\t\t", val)
 		}
 	}
 
 	body, _ := ioutil.ReadAll(resp.Body)
-	fmt.Fprintln(formatted, "Body: ", string(body))
+	fmt.Fprintln(formatted, "\tBody: ", string(body))
 
 	return string(formatted.Bytes())
 }
