@@ -271,9 +271,7 @@ func setupKeyVault(userID, subscriptionID, tenantID uuid.UUID, group resources.G
 						},
 					},
 				},
-				EnabledForDiskEncryption:     to.BoolPtr(true),
-				EnabledForDeployment:         to.BoolPtr(true),
-				EnabledForTemplateDeployment: to.BoolPtr(true),
+				EnabledForDiskEncryption: to.BoolPtr(true),
 				Sku: &keyvault.Sku{
 					Family: to.StringPtr("A"),
 					Name:   keyvault.Standard,
@@ -324,6 +322,10 @@ func setupEncryptionSecret(clientID, tenantID uuid.UUID, authorizer autorest.Aut
 		ContentType: to.StringPtr("manual"),
 		SecretAttributes: &keys.SecretAttributes{
 			Enabled: to.BoolPtr(true),
+		},
+		Tags: &map[string]*string{
+			"DiskEncryptionKeyEncryptionAlgorithm": to.StringPtr("RSA-OAEP"),
+			"DiskEncryptionKeyFileName":            to.StringPtr("LinuxPassPhraseFileName"),
 		},
 		Value: to.StringPtr("Foobar"),
 	})
@@ -425,7 +427,7 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 		Location: resourceGroup.Location,
 		VirtualMachineProperties: &compute.VirtualMachineProperties{
 			HardwareProfile: &compute.HardwareProfile{
-				VMSize: compute.StandardDS1V2,
+				VMSize: compute.StandardDS2V2,
 			},
 			NetworkProfile: &compute.NetworkProfile{
 				NetworkInterfaces: &[]compute.NetworkInterfaceReference{
@@ -472,14 +474,14 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 					},
 				},
 				DataDisks: &[]compute.DataDisk{
-					{
-						CreateOption: compute.Attach,
-						Lun:          to.Int32Ptr(0),
-						ManagedDisk: &compute.ManagedDiskParameters{
-							ID:                 dataDisk.ID,
-							StorageAccountType: compute.StorageAccountTypes(dataDisk.AccountType),
-						},
-					},
+				// {
+				// 	CreateOption: compute.Attach,
+				// 	Lun:          to.Int32Ptr(0),
+				// 	ManagedDisk: &compute.ManagedDiskParameters{
+				// 		ID:                 dataDisk.ID,
+				// 		StorageAccountType: compute.StorageAccountTypes(dataDisk.AccountType),
+				// 	},
+				// },
 				},
 			},
 		},
