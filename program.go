@@ -170,6 +170,24 @@ func main() {
 		return
 	}
 
+	extClient := compute.NewVirtualMachineExtensionsClient(userSubscriptionID.String())
+	extClient.Authorizer = authorizer
+
+	extResults, extErrs := extClient.CreateOrUpdate(*group.Name, *sampleVM.Name, "AzureDiskEncryptionForLinux", compute.VirtualMachineExtension{
+		Location: group.Location,
+		VirtualMachineExtensionProperties: &compute.VirtualMachineExtensionProperties{
+			Publisher: to.StringPtr("Microsoft.Azure.Security"),
+		},
+	}, nil)
+
+	select {
+	case <-extResults:
+		statusLog.Print("Disk Encryption Extension Added")
+	case err = <-extErrs:
+		errLog.Print(err)
+		return
+	}
+
 	exitStatus = 0
 }
 
@@ -334,8 +352,8 @@ func setupEncryptionSecret(clientID, tenantID uuid.UUID, authorizer autorest.Aut
 func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, account storage.Account, vault keyvault.Vault, authorizer, vaultAuthorizer autorest.Authorizer) (<-chan disk.Model, <-chan error) {
 	results, errs := make(chan disk.Model, 1), make(chan error, 1)
 	go func() {
-		var key keys.KeyBundle
-		var secret keys.SecretBundle
+		//	var key keys.KeyBundle
+		//	var secret keys.SecretBundle
 		var err error
 		var created disk.Model
 		defer close(results)
@@ -346,18 +364,18 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 
 		diskName := "disk-" + uuid.NewV4().String()
 
-		key, err = setupEncryptionKey(clientID, tenantID, vaultAuthorizer, vault)
-		if err != nil {
-			errs <- err
-			return
-		}
-		statusLog.Print("Encryption Key Created: ", *key.Key.Kid)
+		// key, err = setupEncryptionKey(clientID, tenantID, vaultAuthorizer, vault)
+		// if err != nil {
+		// 	errs <- err
+		// 	return
+		// }
+		// statusLog.Print("Encryption Key Created: ", *key.Key.Kid)
 
-		secret, err = setupEncryptionSecret(clientID, tenantID, vaultAuthorizer, vault)
-		if err != nil {
-			errs <- err
-			return
-		}
+		// secret, err = setupEncryptionSecret(clientID, tenantID, vaultAuthorizer, vault)
+		// if err != nil {
+		// 	errs <- err
+		// 	return
+		// }
 
 		_, diskErrs := diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
 			Location: group.Location,
@@ -366,21 +384,21 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 					CreateOption: disk.Empty,
 				},
 				DiskSizeGB: to.Int32Ptr(64),
-				EncryptionSettings: &disk.EncryptionSettings{
-					Enabled: to.BoolPtr(true),
-					KeyEncryptionKey: &disk.KeyVaultAndKeyReference{
-						KeyURL: key.Key.Kid,
-						SourceVault: &disk.SourceVault{
-							ID: vault.ID,
-						},
-					},
-					DiskEncryptionKey: &disk.KeyVaultAndSecretReference{
-						SecretURL: secret.ID,
-						SourceVault: &disk.SourceVault{
-							ID: vault.ID,
-						},
-					},
-				},
+				// EncryptionSettings: &disk.EncryptionSettings{
+				// 	Enabled: to.BoolPtr(true),
+				// 	KeyEncryptionKey: &disk.KeyVaultAndKeyReference{
+				// 		KeyURL: key.Key.Kid,
+				// 		SourceVault: &disk.SourceVault{
+				// 			ID: vault.ID,
+				// 		},
+				// 	},
+				// 	DiskEncryptionKey: &disk.KeyVaultAndSecretReference{
+				// 		SecretURL: secret.ID,
+				// 		SourceVault: &disk.SourceVault{
+				// 			ID: vault.ID,
+				// 		},
+				// 	},
+				// },
 			},
 		}, nil)
 		if err = <-diskErrs; err != nil {
