@@ -77,18 +77,15 @@ func main() {
 	var stuff *adal.OAuthConfig
 	stuff, err = adal.NewOAuthConfig(environment.ActiveDirectoryEndpoint, userTenantID.String())
 	if err != nil {
-		errLog.Print(err)
 		return
 	}
 	var foo *adal.ServicePrincipalToken
 	foo, err = adal.NewServicePrincipalTokenFromManualToken(*stuff, userClientID.String(), environment.GraphEndpoint, *token)
 	if err != nil {
-		errLog.Print(err)
 		return
 	}
 	err = foo.Refresh()
 	if err != nil {
-		errLog.Print(err)
 		return
 	}
 
@@ -97,13 +94,11 @@ func main() {
 
 	currentUser, err = graphClient.GetCurrentUser()
 	if err != nil {
-		errLog.Print(err)
 		return
 	}
 	var userID uuid.UUID
 	userID, err = uuid.FromString(*currentUser.ObjectID)
 	if err != nil {
-		errLog.Print(err)
 		return
 	}
 
@@ -126,28 +121,31 @@ func main() {
 		return
 	}
 
+	defer func() {
+		if err != nil {
+			errLog.Print(err)
+		}
+	}()
+
 	// Create Pre-requisites for a VM. Because they are independent, we can do so in parallel.
 	storageAccountResults, storageAccountErrs := setupStorageAccount(userSubscriptionID, group, authorizer)
 	virtualNetworkResults, virtualNetworkErrs := setupVirtualNetwork(userSubscriptionID, group, authorizer)
 	vaultResults, vaultErrs := setupKeyVault(userID, userSubscriptionID, userTenantID, group, authorizer)
 
 	sampleNetwork = <-virtualNetworkResults
-	if err := <-virtualNetworkErrs; err != nil {
-		errLog.Print(err)
+	if err = <-virtualNetworkErrs; err != nil {
 		return
 	}
 	statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
 
 	sampleStorageAccount = <-storageAccountResults
-	if err := <-storageAccountErrs; err != nil {
-		errLog.Print(err)
+	if err = <-storageAccountErrs; err != nil {
 		return
 	}
 	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
 
 	sampleVault = <-vaultResults
-	if err := <-vaultErrs; err != nil {
-		errLog.Print(err)
+	if err = <-vaultErrs; err != nil {
 		return
 	}
 	statusLog.Print("Created Key Vault: ", *sampleVault.Name)
@@ -157,36 +155,45 @@ func main() {
 	dataDiskResults, dataDiskErrs := setupManagedDisk(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, authorizer, vaultAuthorizer)
 
 	if err = <-dataDiskErrs; err != nil {
-		errLog.Print(err)
 		return
 	}
 
 	// Create an Azure Virtual Machine, on which we'll mount an encrypted data disk.
-	if temp, err := setupVirtualMachine(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, vaultAuthorizer, <-dataDiskResults, (*sampleNetwork.Subnets)[0], authorizer, nil); err == nil {
-		sampleVM = temp
-		statusLog.Print("Created Virtual Machine: ", *sampleVM.Name)
-	} else {
-		errLog.Print(err)
+	sampleVM, err = setupVirtualMachine(userClientID, userSubscriptionID, userTenantID, group, sampleStorageAccount, sampleVault, vaultAuthorizer, <-dataDiskResults, (*sampleNetwork.Subnets)[0], authorizer, nil)
+	if err != nil {
 		return
 	}
+	statusLog.Print("Created Virtual Machine: ", *sampleVM.Name)
 
 	extClient := compute.NewVirtualMachineExtensionsClient(userSubscriptionID.String())
 	extClient.Authorizer = authorizer
 
-	extResults, extErrs := extClient.CreateOrUpdate(*group.Name, *sampleVM.Name, "AzureDiskEncryptionForLinux", compute.VirtualMachineExtension{
-		Location: group.Location,
+	_, extErrs := extClient.CreateOrUpdate(*group.Name, *sampleVM.Name, "AzureDiskEncryptionForLinux", compute.VirtualMachineExtension{
+		Location: to.StringPtr("WESTUS2"),
 		VirtualMachineExtensionProperties: &compute.VirtualMachineExtensionProperties{
+			AutoUpgradeMinorVersion: to.BoolPtr(true),
+			ProtectedSettings: &map[string]interface{}{
+				"AADClientSecret": "INSERT YOUR SERVICE PRINCIPAL SECRET HERE",
+				"Passphrase":      "yourPassPhrase", // This sample uses a simple passphrase, but this is absolutely not how you should do this elsewhere.
+			},
 			Publisher: to.StringPtr("Microsoft.Azure.Security"),
+			Settings: &map[string]interface{}{
+				"AADClientID":            "INSERT YOUR SERVICE PRINCIPAL OBJECT ID HERE",
+				"EncryptionOperation":    "EnableEncryption",
+				"KeyEncryptionAlgorithm": "RSA-OAEP",
+				"KeyVaultURL":            vaultURL(sampleVault),
+				"SequenceVersion":        uuid.NewV4().String(),
+				"VolumeType":             "OS",
+			},
+			Type:               to.StringPtr("AzureDiskEncryptionForLinux"),
+			TypeHandlerVersion: to.StringPtr("0.1"),
 		},
 	}, nil)
 
-	select {
-	case <-extResults:
-		statusLog.Print("Disk Encryption Extension Added")
-	case err = <-extErrs:
-		errLog.Print(err)
+	if err = <-extErrs; err != nil {
 		return
 	}
+	statusLog.Print("Disk Encryption Extension Added")
 
 	exitStatus = 0
 }
@@ -282,6 +289,14 @@ func setupKeyVault(userID, subscriptionID, tenantID uuid.UUID, group resources.G
 				AccessPolicies: &[]keyvault.AccessPolicyEntry{
 					{
 						ObjectID: to.StringPtr(userID.String()),
+						TenantID: &tenantID,
+						Permissions: &keyvault.Permissions{
+							Keys:    &[]keyvault.KeyPermissions{keyvault.KeyPermissionsAll},
+							Secrets: &[]keyvault.SecretPermissions{keyvault.SecretPermissionsAll},
+						},
+					},
+					{
+						ObjectID: to.StringPtr("INSERT YOUR SERVICE PRINCIPAL OBJECT ID HERE"),
 						TenantID: &tenantID,
 						Permissions: &keyvault.Permissions{
 							Keys:    &[]keyvault.KeyPermissions{keyvault.KeyPermissionsAll},
@@ -429,17 +444,17 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 		return
 	}
 
-	var osKey keys.KeyBundle
-	osKey, err = setupEncryptionKey(clientID, tenantID, vaultAuthorizer, vault)
-	if err != nil {
-		return
-	}
+	// var osKey keys.KeyBundle
+	// osKey, err = setupEncryptionKey(clientID, tenantID, vaultAuthorizer, vault)
+	// if err != nil {
+	// 	return
+	// }
 
-	var osSecret keys.SecretBundle
-	osSecret, err = setupEncryptionSecret(clientID, tenantID, vaultAuthorizer, vault)
-	if err != nil {
-		return
-	}
+	// var osSecret keys.SecretBundle
+	// osSecret, err = setupEncryptionSecret(clientID, tenantID, vaultAuthorizer, vault)
+	// if err != nil {
+	// 	return
+	// }
 
 	results, errs := client.CreateOrUpdate(*resourceGroup.Name, vmName, compute.VirtualMachine{
 		Location: resourceGroup.Location,
@@ -475,21 +490,21 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 				OsDisk: &compute.OSDisk{
 					CreateOption: compute.FromImage,
 					DiskSizeGB:   to.Int32Ptr(64),
-					EncryptionSettings: &compute.DiskEncryptionSettings{
-						DiskEncryptionKey: &compute.KeyVaultSecretReference{
-							SecretURL: osSecret.ID,
-							SourceVault: &compute.SubResource{
-								ID: vault.ID,
-							},
-						},
-						Enabled: to.BoolPtr(true),
-						KeyEncryptionKey: &compute.KeyVaultKeyReference{
-							KeyURL: osKey.Key.Kid,
-							SourceVault: &compute.SubResource{
-								ID: vault.ID,
-							},
-						},
-					},
+					// EncryptionSettings: &compute.DiskEncryptionSettings{
+					// 	DiskEncryptionKey: &compute.KeyVaultSecretReference{
+					// 		SecretURL: osSecret.ID,
+					// 		SourceVault: &compute.SubResource{
+					// 			ID: vault.ID,
+					// 		},
+					// 	},
+					// 	Enabled: to.BoolPtr(true),
+					// 	KeyEncryptionKey: &compute.KeyVaultKeyReference{
+					// 		KeyURL: osKey.Key.Kid,
+					// 		SourceVault: &compute.SubResource{
+					// 			ID: vault.ID,
+					// 		},
+					// 	},
+					// },
 				},
 				DataDisks: &[]compute.DataDisk{
 				// {
@@ -507,6 +522,54 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 	err = <-errs
 	created = <-results
 	return
+}
+
+func setupServicePrincipal(tenantID uuid.UUID, authToken adal.Token) (<-chan graphrbac.ServicePrincipal, <-chan error, func() error) {
+	results, errs := make(chan graphrbac.ServicePrincipal, 1), make(chan error, 1)
+
+	deleter := func() (retval func() error) {
+		var spt *adal.ServicePrincipalToken
+		var config *adal.OAuthConfig
+		var err error
+		var result graphrbac.ServicePrincipal
+
+		retval = func() error { return nil }
+
+		defer close(errs)
+		defer close(results)
+
+		config, err = adal.NewOAuthConfig(environment.ActiveDirectoryEndpoint, tenantID.String())
+		if err != nil {
+			errs <- err
+			return
+		}
+
+		spt, err = adal.NewServicePrincipalTokenFromManualToken(*config, userClientID.String(), environment.GraphEndpoint, authToken)
+		if err != nil {
+			errs <- err
+			return
+		}
+
+		client := graphrbac.NewServicePrincipalsClient(tenantID.String())
+		client.Authorizer = autorest.NewBearerAuthorizer(spt)
+
+		result, err = client.Create(graphrbac.ServicePrincipalCreateParameters{
+			AccountEnabled: to.BoolPtr(false),
+		})
+		if err != nil {
+			errs <- err
+			return
+		}
+
+		results <- result
+		retval = func() (delErr error) {
+			_, delErr = client.Delete(*result.ObjectID)
+			return
+		}
+		return
+	}()
+
+	return results, errs, deleter
 }
 
 func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group, authorizer autorest.Authorizer) (<-chan network.VirtualNetwork, <-chan error) {
