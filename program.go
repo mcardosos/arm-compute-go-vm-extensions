@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 
+	"errors"
+
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
 	"github.com/Azure/azure-sdk-for-go/arm/disk"
 	"github.com/Azure/azure-sdk-for-go/arm/graphrbac"
@@ -41,7 +43,14 @@ var (
 )
 
 const (
-	location = "WESTUS2"
+	location                      = "WESTUS2"
+	vmProfile                     = compute.StandardDS2V2
+	servicePrincipalApplicationID = "INSERT YOUR SERVICE PRINCIPAL APPLICATION ID HERE"
+
+	// You can find this using the azure CLI 2.0 by running the following command after replacing {servicePrincipalApplicationID}:
+	// az ad sp show --id {servicePrincipalApplicationID}
+	servicePrincipalObjectID = "INSERT YOUR SERVICE PRINCIPAL OBJECT ID HERE"
+	servicePrincipalSectet   = "INSERT YOUR SERVICE PRINCIPAL SECRET HERE"
 )
 
 func main() {
@@ -165,25 +174,37 @@ func main() {
 	}
 	statusLog.Print("Created Virtual Machine: ", *sampleVM.Name)
 
+	var kekBundle keys.KeyBundle
+	kekBundle, err = setupEncryptionKey(userClientID, userTenantID, vaultAuthorizer, sampleVault)
+	if err != nil {
+		return
+	}
+	statusLog.Print("Created KEK: ", *kekBundle.Key.Kid)
+
 	extClient := compute.NewVirtualMachineExtensionsClient(userSubscriptionID.String())
 	extClient.Authorizer = authorizer
+
+	asdf := vaultURL(sampleVault)
+	debugLog.Print("Vault URL: ", asdf)
+	asdf = strings.Trim(asdf, "/")
 
 	_, extErrs := extClient.CreateOrUpdate(*group.Name, *sampleVM.Name, "AzureDiskEncryptionForLinux", compute.VirtualMachineExtension{
 		Location: to.StringPtr("WESTUS2"),
 		VirtualMachineExtensionProperties: &compute.VirtualMachineExtensionProperties{
 			AutoUpgradeMinorVersion: to.BoolPtr(true),
 			ProtectedSettings: &map[string]interface{}{
-				"AADClientSecret": "INSERT YOUR SERVICE PRINCIPAL SECRET HERE",
-				"Passphrase":      "yourPassPhrase", // This sample uses a simple passphrase, but this is absolutely not how you should do this elsewhere.
+				"AADClientSecret": servicePrincipalSectet, // The Secret that was created for the service principal secret.
+				"Passphrase":      "yourPassPhrase",       // This sample uses a simple passphrase, but you should absolutely use something more sophisticated.
 			},
 			Publisher: to.StringPtr("Microsoft.Azure.Security"),
 			Settings: &map[string]interface{}{
-				"AADClientID":            "INSERT YOUR SERVICE PRINCIPAL OBJECT ID HERE",
-				"EncryptionOperation":    "EnableEncryption",
-				"KeyEncryptionAlgorithm": "RSA-OAEP",
-				"KeyVaultURL":            vaultURL(sampleVault),
-				"SequenceVersion":        uuid.NewV4().String(),
-				"VolumeType":             "OS",
+				"AADClientID":               servicePrincipalApplicationID,
+				"EncryptionOperation":       "EnableEncryption",
+				"KeyEncryptionAlgorithm":    "RSA-OAEP",
+				"KeyEncryptionKeyAlgorithm": *kekBundle.Key.Kid,
+				"KeyVaultURL":               asdf,
+				"SequenceVersion":           uuid.NewV4().String(),
+				"VolumeType":                "OS",
 			},
 			Type:               to.StringPtr("AzureDiskEncryptionForLinux"),
 			TypeHandlerVersion: to.StringPtr("0.1"),
@@ -296,7 +317,7 @@ func setupKeyVault(userID, subscriptionID, tenantID uuid.UUID, group resources.G
 						},
 					},
 					{
-						ObjectID: to.StringPtr("INSERT YOUR SERVICE PRINCIPAL OBJECT ID HERE"),
+						ObjectID: to.StringPtr(servicePrincipalObjectID), // The ObjectID of the Service Principal (not the application around it) that will be used programmatically by the extension
 						TenantID: &tenantID,
 						Permissions: &keyvault.Permissions{
 							Keys:    &[]keyvault.KeyPermissions{keyvault.KeyPermissionsAll},
@@ -345,30 +366,9 @@ func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer autorest.Author
 	return
 }
 
-func setupEncryptionSecret(clientID, tenantID uuid.UUID, authorizer autorest.Authorizer, vault keyvault.Vault) (keys.SecretBundle, error) {
-	client := keys.New()
-	client.Authorizer = authorizer
-
-	secretName := "secret-" + uuid.NewV4().String()
-
-	return client.SetSecret(vaultURL(vault), secretName, keys.SecretSetParameters{
-		ContentType: to.StringPtr("manual"),
-		SecretAttributes: &keys.SecretAttributes{
-			Enabled: to.BoolPtr(true),
-		},
-		Tags: &map[string]*string{
-			"DiskEncryptionKeyEncryptionAlgorithm": to.StringPtr("RSA-OAEP"),
-			"DiskEncryptionKeyFileName":            to.StringPtr("LinuxPassPhraseFileName"),
-		},
-		Value: to.StringPtr("Foobar"),
-	})
-}
-
 func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resources.Group, account storage.Account, vault keyvault.Vault, authorizer, vaultAuthorizer autorest.Authorizer) (<-chan disk.Model, <-chan error) {
 	results, errs := make(chan disk.Model, 1), make(chan error, 1)
 	go func() {
-		//	var key keys.KeyBundle
-		//	var secret keys.SecretBundle
 		var err error
 		var created disk.Model
 		defer close(results)
@@ -379,19 +379,6 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 
 		diskName := "disk-" + uuid.NewV4().String()
 
-		// key, err = setupEncryptionKey(clientID, tenantID, vaultAuthorizer, vault)
-		// if err != nil {
-		// 	errs <- err
-		// 	return
-		// }
-		// statusLog.Print("Encryption Key Created: ", *key.Key.Kid)
-
-		// secret, err = setupEncryptionSecret(clientID, tenantID, vaultAuthorizer, vault)
-		// if err != nil {
-		// 	errs <- err
-		// 	return
-		// }
-
 		_, diskErrs := diskClient.CreateOrUpdate(*group.Name, diskName, disk.Model{
 			Location: group.Location,
 			Properties: &disk.Properties{
@@ -399,21 +386,6 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 					CreateOption: disk.Empty,
 				},
 				DiskSizeGB: to.Int32Ptr(64),
-				// EncryptionSettings: &disk.EncryptionSettings{
-				// 	Enabled: to.BoolPtr(true),
-				// 	KeyEncryptionKey: &disk.KeyVaultAndKeyReference{
-				// 		KeyURL: key.Key.Kid,
-				// 		SourceVault: &disk.SourceVault{
-				// 			ID: vault.ID,
-				// 		},
-				// 	},
-				// 	DiskEncryptionKey: &disk.KeyVaultAndSecretReference{
-				// 		SecretURL: secret.ID,
-				// 		SourceVault: &disk.SourceVault{
-				// 			ID: vault.ID,
-				// 		},
-				// 	},
-				// },
 			},
 		}, nil)
 		if err = <-diskErrs; err != nil {
@@ -444,23 +416,26 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 		return
 	}
 
-	// var osKey keys.KeyBundle
-	// osKey, err = setupEncryptionKey(clientID, tenantID, vaultAuthorizer, vault)
-	// if err != nil {
-	// 	return
-	// }
+	var storageURI *string
+	if storageAccount.PrimaryEndpoints != nil {
+		storageURI = (*storageAccount.PrimaryEndpoints).Blob
+	} else {
+		err = errors.New("No storage endpoint found")
+		return
+	}
+	debugLog.Print("Storage URL: ", *storageAccount.ID)
 
-	// var osSecret keys.SecretBundle
-	// osSecret, err = setupEncryptionSecret(clientID, tenantID, vaultAuthorizer, vault)
-	// if err != nil {
-	// 	return
-	// }
-
-	results, errs := client.CreateOrUpdate(*resourceGroup.Name, vmName, compute.VirtualMachine{
+	_, createErrs := client.CreateOrUpdate(*resourceGroup.Name, vmName, compute.VirtualMachine{
 		Location: resourceGroup.Location,
 		VirtualMachineProperties: &compute.VirtualMachineProperties{
+			DiagnosticsProfile: &compute.DiagnosticsProfile{
+				BootDiagnostics: &compute.BootDiagnostics{
+					Enabled:    to.BoolPtr(true),
+					StorageURI: storageURI,
+				},
+			},
 			HardwareProfile: &compute.HardwareProfile{
-				VMSize: compute.StandardDS2V2,
+				VMSize: vmProfile,
 			},
 			NetworkProfile: &compute.NetworkProfile{
 				NetworkInterfaces: &[]compute.NetworkInterfaceReference{
@@ -490,37 +465,16 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 				OsDisk: &compute.OSDisk{
 					CreateOption: compute.FromImage,
 					DiskSizeGB:   to.Int32Ptr(64),
-					// EncryptionSettings: &compute.DiskEncryptionSettings{
-					// 	DiskEncryptionKey: &compute.KeyVaultSecretReference{
-					// 		SecretURL: osSecret.ID,
-					// 		SourceVault: &compute.SubResource{
-					// 			ID: vault.ID,
-					// 		},
-					// 	},
-					// 	Enabled: to.BoolPtr(true),
-					// 	KeyEncryptionKey: &compute.KeyVaultKeyReference{
-					// 		KeyURL: osKey.Key.Kid,
-					// 		SourceVault: &compute.SubResource{
-					// 			ID: vault.ID,
-					// 		},
-					// 	},
-					// },
 				},
-				DataDisks: &[]compute.DataDisk{
-				// {
-				// 	CreateOption: compute.Attach,
-				// 	Lun:          to.Int32Ptr(0),
-				// 	ManagedDisk: &compute.ManagedDiskParameters{
-				// 		ID:                 dataDisk.ID,
-				// 		StorageAccountType: compute.StorageAccountTypes(dataDisk.AccountType),
-				// 	},
-				// },
-				},
+				DataDisks: &[]compute.DataDisk{},
 			},
 		},
 	}, cancel)
-	err = <-errs
-	created = <-results
+	if err = <-createErrs; err != nil {
+		return
+	}
+
+	created, err = client.Get(*resourceGroup.Name, vmName, "")
 	return
 }
 
