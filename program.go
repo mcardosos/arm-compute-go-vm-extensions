@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,8 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
-
-	"errors"
+	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
 	"github.com/Azure/azure-sdk-for-go/arm/disk"
@@ -141,23 +140,40 @@ func main() {
 	virtualNetworkResults, virtualNetworkErrs := setupVirtualNetwork(userSubscriptionID, group, authorizer)
 	vaultResults, vaultErrs := setupKeyVault(userID, userSubscriptionID, userTenantID, group, authorizer)
 
-	sampleNetwork = <-virtualNetworkResults
-	if err = <-virtualNetworkErrs; err != nil {
-		return
-	}
-	statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
+	var wg1 sync.WaitGroup
+	wg1.Add(3)
 
-	sampleStorageAccount = <-storageAccountResults
-	if err = <-storageAccountErrs; err != nil {
-		return
-	}
-	statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
+	go func() {
+		defer wg1.Done()
+		sampleNetwork = <-virtualNetworkResults
+		if err = <-virtualNetworkErrs; err != nil {
+			return
+		}
+		statusLog.Print("Created Virtual Network: ", *sampleNetwork.Name)
+	}()
 
-	sampleVault = <-vaultResults
-	if err = <-vaultErrs; err != nil {
+	go func() {
+		defer wg1.Done()
+		sampleStorageAccount = <-storageAccountResults
+		if err = <-storageAccountErrs; err != nil {
+			return
+		}
+		statusLog.Print("Created Storage Account: ", *sampleStorageAccount.Name)
+	}()
+
+	go func() {
+		defer wg1.Done()
+		sampleVault = <-vaultResults
+		if err = <-vaultErrs; err != nil {
+			return
+		}
+		statusLog.Print("Created Key Vault: ", *sampleVault.Name)
+	}()
+
+	wg1.Wait()
+	if err != nil {
 		return
 	}
-	statusLog.Print("Created Key Vault: ", *sampleVault.Name)
 
 	vaultAuthorizer, err = vaultAuthentication(userClientID, userTenantID, *token)
 
@@ -184,10 +200,6 @@ func main() {
 	extClient := compute.NewVirtualMachineExtensionsClient(userSubscriptionID.String())
 	extClient.Authorizer = authorizer
 
-	asdf := vaultURL(sampleVault)
-	debugLog.Print("Vault URL: ", asdf)
-	asdf = strings.Trim(asdf, "/")
-
 	_, extErrs := extClient.CreateOrUpdate(*group.Name, *sampleVM.Name, "AzureDiskEncryptionForLinux", compute.VirtualMachineExtension{
 		Location: to.StringPtr("WESTUS2"),
 		VirtualMachineExtensionProperties: &compute.VirtualMachineExtensionProperties{
@@ -202,9 +214,9 @@ func main() {
 				"EncryptionOperation":       "EnableEncryption",
 				"KeyEncryptionAlgorithm":    "RSA-OAEP",
 				"KeyEncryptionKeyAlgorithm": *kekBundle.Key.Kid,
-				"KeyVaultURL":               asdf,
+				"KeyVaultURL":               vaultURL(sampleVault),
 				"SequenceVersion":           uuid.NewV4().String(),
-				"VolumeType":                "OS",
+				"VolumeType":                "ALL",
 			},
 			Type:               to.StringPtr("AzureDiskEncryptionForLinux"),
 			TypeHandlerVersion: to.StringPtr("0.1"),
@@ -466,7 +478,16 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 					CreateOption: compute.FromImage,
 					DiskSizeGB:   to.Int32Ptr(64),
 				},
-				DataDisks: &[]compute.DataDisk{},
+				DataDisks: &[]compute.DataDisk{
+					{
+						CreateOption: compute.Attach,
+						Lun:          to.Int32Ptr(0),
+						ManagedDisk: &compute.ManagedDiskParameters{
+							ID:                 dataDisk.ID,
+							StorageAccountType: compute.StorageAccountTypes(storageAccount.Sku.Name),
+						},
+					},
+				},
 			},
 		},
 	}, cancel)
@@ -740,37 +761,4 @@ func vaultAuthentication(clientID, tenantID uuid.UUID, token adal.Token) (author
 
 func vaultURL(vault keyvault.Vault) string {
 	return fmt.Sprintf("https://%s.vault.azure.net/", *vault.Name)
-}
-
-func formatResponse(resp autorest.Response) string {
-	formatted := &bytes.Buffer{}
-
-	fmt.Fprintln(formatted, "Request:")
-	fmt.Fprintln(formatted, "\tHeaders:")
-
-	for header, values := range resp.Request.Header {
-		fmt.Fprintln(formatted, "\t\t", header)
-		for _, val := range values {
-			fmt.Fprintln(formatted, "\t\t\t", val)
-		}
-	}
-	reqBody, _ := ioutil.ReadAll(resp.Request.Body)
-	fmt.Fprintln(formatted, "\tBody: ", string(reqBody))
-	fmt.Fprintln(formatted, "\tRemote Address: ", resp.Request.RemoteAddr)
-
-	fmt.Fprintln(formatted, "Response:")
-	fmt.Fprintln(formatted, "\tStatus Code: ", resp.Status)
-
-	fmt.Fprintln(formatted, "\tHeaders:")
-	for header, values := range resp.Header {
-		fmt.Fprintln(formatted, "\t\t", header)
-		for _, val := range values {
-			fmt.Fprintln(formatted, "\t\t\t", val)
-		}
-	}
-
-	body, _ := ioutil.ReadAll(resp.Body)
-	fmt.Fprintln(formatted, "\tBody: ", string(body))
-
-	return string(formatted.Bytes())
 }
