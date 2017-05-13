@@ -14,7 +14,7 @@
 2. Update the "const" section at the top of program.go to match the service principal you created during the pre-requisite section of this document. Optionally, you can change the size and location of the VM created.
 Note: If this part is not done correctly, the sample will fail saying "Enable failed."
 3. From the folder containing program.go, run the command: `glide install`
-4. In the same folder, execute the sample by running the following command: `go run program.go -subscription {subsciptionGUID} -tenant {subscriptionGUID} -wait`
+4. In the same folder, execute the sample by running the following command: `go run program.go -wait`
 5. If you used the `-wait` flag, after about 10 minutes, you will prompted with the message "press ENTER to continue...". At that time, you can inspect the VM through the Azure portal and see that the encryption extension has been installed and has started the encryption process.
 6. Wait for the sample to complete to ensure that all objects created by the sample are deleted.
 

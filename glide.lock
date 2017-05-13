@@ -1,14 +1,16 @@
 hash: 73d8cbf1f965e5b5ac50754dd4547c358c7fa7cd22d8772f8f465ada3ede2075
-updated: 2017-05-05T11:13:18.5992274-07:00
+updated: 2017-05-12T16:43:28.8843665-07:00
 imports:
 - name: github.com/Azure/azure-sdk-for-go
-  version: f1a79898fb9bcc567a42184ae08ccc1c17f8f593
+  version: 5841475edc7c8725d79885d635aa8956f97fdf0e
   subpackages:
   - arm/compute
   - arm/network
   - arm/resources/resources
   - arm/disk
+  - arm/graphrbac
   - arm/keyvault
+  - arm/resources/subscriptions
   - arm/storage
   - dataplane/keyvault
 - name: github.com/Azure/go-autorest

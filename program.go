@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/arm/keyvault"
 	"github.com/Azure/azure-sdk-for-go/arm/network"
 	"github.com/Azure/azure-sdk-for-go/arm/resources/resources"
+	"github.com/Azure/azure-sdk-for-go/arm/resources/subscriptions"
 	"github.com/Azure/azure-sdk-for-go/arm/storage"
 	keys "github.com/Azure/azure-sdk-for-go/dataplane/keyvault"
 	"github.com/Azure/go-autorest/autorest"
@@ -69,17 +70,51 @@ func main() {
 		os.Exit(exitStatus)
 	}()
 
-	debugLog.Println("Using Subscription ID: ", userSubscriptionID)
-	debugLog.Println("Using Tenant ID: ", userTenantID)
-
 	// Get authenticated so we can access the subscription used to run this sample.
-	if temp, err := authenticate(userClientID, userTenantID); err == nil {
+	if temp, err := authenticate(userClientID); err == nil {
 		token = temp
 		authorizer = autorest.NewBearerAuthorizer(token)
 	} else {
 		errLog.Printf("could not authenticate. Error: %v", err)
 		return
 	}
+
+	subscriptionResults, subscriptionErrs := getSubscriptions(authorizer)
+	var subscriptionCache []subscriptions.Subscription
+	for subscription := range subscriptionResults {
+		subscriptionCache = append(subscriptionCache, subscription)
+	}
+	err = <-subscriptionErrs
+	if err != nil {
+		errLog.Print(err)
+		return
+	}
+
+	var selectedSubscription subscriptions.Subscription
+	if subCount := len(subscriptionCache); subCount == 1 {
+		selectedSubscription = subscriptionCache[0]
+	} else {
+		var selected int
+		fmt.Println("Multiple subscriptions are associated with this account.\nPlease select the subscription you would like to use from the following list:")
+		for i, currentSub := range subscriptionCache {
+			fmt.Printf("\t%d) %s\n", i, *currentSub.DisplayName)
+		}
+		fmt.Print("Selection: ")
+		_, err = fmt.Scanf("%d", &selected)
+		if err != nil {
+			errLog.Print(err)
+			return
+		}
+		selectedSubscription = subscriptionCache[selected]
+	}
+
+	var parsed uuid.UUID
+	parsed, err = uuid.FromString(*selectedSubscription.SubscriptionID)
+	if err != nil {
+		errLog.Print(err)
+		return
+	}
+	userSubscriptionID = parsed
 
 	// Get AAD ObjectID of the currently authenticated user to give them and only them access to the Key Vault created below.
 	var stuff *adal.OAuthConfig
@@ -94,6 +129,7 @@ func main() {
 	}
 	err = foo.Refresh()
 	if err != nil {
+		errLog.Print(err)
 		return
 	}
 
@@ -102,11 +138,13 @@ func main() {
 
 	currentUser, err = graphClient.GetCurrentUser()
 	if err != nil {
+		errLog.Print(err)
 		return
 	}
 	var userID uuid.UUID
 	userID, err = uuid.FromString(*currentUser.ObjectID)
 	if err != nil {
+		errLog.Print(err)
 		return
 	}
 
@@ -237,8 +275,8 @@ func init() {
 	errLog = log.New(os.Stderr, "[ERROR] ", 0)
 	statusLog = log.New(os.Stdout, "[STATUS] ", log.Ltime)
 
-	unformattedSubscriptionID := flag.String("subscription", os.Getenv("AZURE_SUBSCRIPTION_ID"), "The subscription that will be targeted when running this sample.")
-	unformattedTenantID := flag.String("tenant", os.Getenv("AZURE_TENANT_ID"), "The tenant that hosts the subscription to be used by this sample.")
+	// unformattedSubscriptionID := flag.String("subscription", os.Getenv("AZURE_SUBSCRIPTION_ID"), "The subscription that will be targeted when running this sample.")
+	// unformattedTenantID := flag.String("tenant", os.Getenv("AZURE_TENANT_ID"), "The tenant that hosts the subscription to be used by this sample.")
 	printDebug := flag.Bool("debug", false, "Include debug information in the output of this program.")
 	flag.BoolVar(&wait, "wait", false, "Use to wait for user acknowledgement before deletion of the created assets.")
 	flag.Parse()
@@ -254,8 +292,8 @@ func init() {
 		return retval
 	}
 
-	userSubscriptionID = ensureUUID("Subscription ID", *unformattedSubscriptionID)
-	userTenantID = ensureUUID("Tenant ID", *unformattedTenantID)
+	// userSubscriptionID = ensureUUID("Subscription ID", *unformattedSubscriptionID)
+	// userTenantID = ensureUUID("Tenant ID", *unformattedTenantID)
 	userClientID = ensureUUID("Client ID", "04b07795-8ddb-461a-bbee-02f9e1bf7b46") // This is the client ID for the Azure CLI. It was chosen for its public well-known status.
 
 	var debugWriter io.Writer
@@ -698,35 +736,144 @@ func setupStorageAccount(subscriptionID uuid.UUID, group resources.Group, author
 }
 
 // authenticate gets an authorization token to allow clients to access Azure assets.
-func authenticate(clientID, tenantID uuid.UUID) (*adal.Token, error) {
+func authenticate(clientID uuid.UUID) (token *adal.Token, err error) {
 	authClient := autorest.NewClientWithUserAgent("github.com/Azure-Samples/arm-compute-go-vm-extensions")
 	var deviceCode *adal.DeviceCode
-	var token *adal.Token
 	var config *adal.OAuthConfig
 
-	if temp, err := adal.NewOAuthConfig(environment.ActiveDirectoryEndpoint, tenantID.String()); err == nil {
-		config = temp
+	config, err = adal.NewOAuthConfig(environment.ActiveDirectoryEndpoint, "common")
+	if err != nil {
+		return
+	}
+
+	deviceCode, err = adal.InitiateDeviceAuth(&authClient, *config, clientID.String(), environment.ServiceManagementEndpoint)
+	if err != nil {
+		return
+	}
+
+	_, err = fmt.Println(*deviceCode.Message)
+	if err != nil {
+		return
+	}
+
+	token, err = adal.WaitForUserCompletion(&authClient, deviceCode)
+	if err != nil {
+		return
+	}
+
+	var tenantCache []string
+	tenants, tenantErrs := getTenants(autorest.NewBearerAuthorizer(token))
+	for tenant := range tenants {
+		tenantCache = append(tenantCache, *tenant.TenantID)
+	}
+	err = <-tenantErrs
+	if err != nil {
+		return
+	}
+
+	if len(tenantCache) == 1 {
+		userTenantID, err = uuid.FromString(tenantCache[0])
 	} else {
-		return nil, err
+		err = errors.New("zero or multiple tenants associated with this account")
+		return
 	}
 
-	if temp, err := adal.InitiateDeviceAuth(&authClient, *config, clientID.String(), environment.ServiceManagementEndpoint); err == nil {
-		deviceCode = temp
-	} else {
-		return nil, err
+	config, err = adal.NewOAuthConfig(environment.ActiveDirectoryEndpoint, userTenantID.String())
+
+	var spt *adal.ServicePrincipalToken
+	spt, err = adal.NewServicePrincipalTokenFromManualToken(*config, clientID.String(), environment.ResourceManagerEndpoint, *token)
+	if err != nil {
+		token = nil
+		return
 	}
 
-	if _, err := fmt.Println(*deviceCode.Message); err != nil {
-		return nil, err
-	}
+	token = &spt.Token
+	return
+}
 
-	if temp, err := adal.WaitForUserCompletion(&authClient, deviceCode); err == nil {
-		token = temp
-	} else {
-		return nil, err
-	}
+func getTenants(authorizer autorest.Authorizer) (<-chan subscriptions.TenantIDDescription, <-chan error) {
+	results, errs := make(chan subscriptions.TenantIDDescription), make(chan error, 1)
+	go func() {
+		var err error
+		var fetchTenantUpdater sync.Once
 
-	return token, nil
+		defer close(results)
+		defer close(errs)
+
+		tenantClient := subscriptions.NewTenantsClient()
+		tenantClient.Authorizer = authorizer
+
+		var fetchTenants func() (subscriptions.TenantListResult, error)
+		fetchTenants = tenantClient.List
+
+		var tenantChunk subscriptions.TenantListResult
+		for {
+			tenantChunk, err = fetchTenants()
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			for _, tenant := range *tenantChunk.Value {
+				results <- tenant
+			}
+
+			if tenantChunk.NextLink == nil {
+				break
+			}
+			fetchTenantUpdater.Do(func() {
+				fetchTenants = func() (subscriptions.TenantListResult, error) {
+					return tenantClient.ListNextResults(tenantChunk)
+				}
+			})
+		}
+
+	}()
+	return results, errs
+}
+
+func getSubscriptions(authorizer autorest.Authorizer) (<-chan subscriptions.Subscription, <-chan error) {
+	results, errs := make(chan subscriptions.Subscription), make(chan error, 1)
+
+	go func() {
+		var err error
+		var fetchSubscriptionsUpdater sync.Once
+
+		defer close(results)
+		defer close(errs)
+
+		client := subscriptions.NewGroupClient()
+		client.Authorizer = authorizer
+
+		var fetchSubscriptions func() (subscriptions.ListResult, error)
+		fetchSubscriptions = client.List
+
+		for {
+			var subscriptionChunk subscriptions.ListResult
+
+			subscriptionChunk, err = fetchSubscriptions()
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			for _, subscription := range *subscriptionChunk.Value {
+				results <- subscription
+			}
+
+			if subscriptionChunk.NextLink == nil {
+				break
+			}
+
+			fetchSubscriptionsUpdater.Do(func() {
+				fetchSubscriptions = func() (subscriptions.ListResult, error) {
+					return client.ListNextResults(subscriptionChunk)
+				}
+			})
+		}
+	}()
+
+	return results, errs
 }
 
 func vaultAuthentication(clientID, tenantID uuid.UUID, token adal.Token) (authorizer autorest.Authorizer, err error) {
@@ -756,6 +903,7 @@ func vaultAuthentication(clientID, tenantID uuid.UUID, token adal.Token) (author
 	}
 
 	authorizer = autorest.NewBearerAuthorizer(spt)
+
 	return
 }
 
