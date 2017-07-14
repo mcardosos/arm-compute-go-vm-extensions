@@ -25,6 +25,7 @@ import (
 	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/go-autorest/autorest/utils"
 	"github.com/satori/uuid"
 )
 
@@ -33,6 +34,8 @@ var (
 	userSubscriptionID uuid.UUID
 	userTenantID       uuid.UUID
 	environment        = azure.PublicCloud
+
+	sampleUA = fmt.Sprintf("sample/0005/%s", utils.GetCommit())
 )
 
 var (
@@ -135,6 +138,7 @@ func main() {
 
 	graphClient := graphrbac.NewObjectsClient(userTenantID.String())
 	graphClient.Authorizer = autorest.NewBearerAuthorizer(foo)
+	graphClient.Client.AddToUserAgent(sampleUA)
 
 	currentUser, err = graphClient.GetCurrentUser()
 	if err != nil {
@@ -237,6 +241,7 @@ func main() {
 
 	extClient := compute.NewVirtualMachineExtensionsClient(userSubscriptionID.String())
 	extClient.Authorizer = authorizer
+	extClient.Client.AddToUserAgent(sampleUA)
 
 	_, extErrs := extClient.CreateOrUpdate(*group.Name, *sampleVM.Name, "AzureDiskEncryptionForLinux", compute.VirtualMachineExtension{
 		Location: to.StringPtr("WESTUS2"),
@@ -312,6 +317,7 @@ func init() {
 func setupResourceGroup(subscriptionID uuid.UUID, authorizer autorest.Authorizer) (created resources.Group, deleter func() <-chan error, err error) {
 	resourceClient := resources.NewGroupsClient(subscriptionID.String())
 	resourceClient.Authorizer = authorizer
+	resourceClient.Client.AddToUserAgent(sampleUA)
 
 	name := fmt.Sprintf("sample-rg%s", uuid.NewV4().String())
 
@@ -348,6 +354,7 @@ func setupKeyVault(userID, subscriptionID, tenantID uuid.UUID, group resources.G
 
 		client := keyvault.NewVaultsClient(subscriptionID.String())
 		client.Authorizer = authorizer
+		client.Client.AddToUserAgent(sampleUA)
 
 		vaultName := uuid.NewV4().String()
 		vaultName = strings.Replace(vaultName, "-", "", -1)
@@ -398,6 +405,7 @@ func setupKeyVault(userID, subscriptionID, tenantID uuid.UUID, group resources.G
 func setupEncryptionKey(clientID, tenantID uuid.UUID, authorizer autorest.Authorizer, vault keyvault.Vault) (key keys.KeyBundle, err error) {
 	client := keys.New()
 	client.Authorizer = authorizer
+	client.Client.AddToUserAgent(sampleUA)
 
 	keyName := "key-" + uuid.NewV4().String()
 
@@ -426,6 +434,7 @@ func setupManagedDisk(clientID, subscriptionID, tenantID uuid.UUID, group resour
 
 		diskClient := disk.NewDisksClient(subscriptionID.String())
 		diskClient.Authorizer = authorizer
+		diskClient.Client.AddToUserAgent(sampleUA)
 
 		diskName := "disk-" + uuid.NewV4().String()
 
@@ -458,6 +467,7 @@ func setupVirtualMachine(clientID, subscriptionID, tenantID uuid.UUID, resourceG
 
 	client := compute.NewVirtualMachinesClient(subscriptionID.String())
 	client.Authorizer = authorizer
+	client.Client.AddToUserAgent(sampleUA)
 
 	vmName := fmt.Sprintf("sample-vm%s", uuid.NewV4().String())
 
@@ -565,6 +575,7 @@ func setupServicePrincipal(tenantID uuid.UUID, authToken adal.Token) (<-chan gra
 
 		client := graphrbac.NewServicePrincipalsClient(tenantID.String())
 		client.Authorizer = autorest.NewBearerAuthorizer(spt)
+		client.Client.AddToUserAgent(sampleUA)
 
 		result, err = client.Create(graphrbac.ServicePrincipalCreateParameters{
 			AccountEnabled: to.BoolPtr(false),
@@ -598,6 +609,7 @@ func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group
 
 		networkClient := network.NewVirtualNetworksClient(subscriptionID.String())
 		networkClient.Authorizer = authorizer
+		networkClient.Client.AddToUserAgent(sampleUA)
 
 		const networkName = "sampleNetwork"
 
@@ -618,6 +630,7 @@ func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group
 
 		subnetClient := network.NewSubnetsClient(subscriptionID.String())
 		subnetClient.Authorizer = authorizer
+		subnetClient.Client.AddToUserAgent(sampleUA)
 
 		const subnetName = "sampleSubnet"
 
@@ -647,6 +660,7 @@ func setupVirtualNetwork(subscriptionID uuid.UUID, resourceGroup resources.Group
 func setupNetworkInterface(subscriptionID uuid.UUID, resourceGroup resources.Group, subnet network.Subnet, machine network.SubResource, authorizer autorest.Authorizer) (created network.Interface, err error) {
 	client := network.NewInterfacesClient(subscriptionID.String())
 	client.Authorizer = authorizer
+	client.Client.AddToUserAgent(sampleUA)
 
 	var ip network.PublicIPAddress
 
@@ -687,6 +701,7 @@ func setupNetworkInterface(subscriptionID uuid.UUID, resourceGroup resources.Gro
 func setupNetworkSecurityGroup(subscriptionID, resourceGroupName string, authorizer autorest.Authorizer) (created network.SecurityGroup, err error) {
 	client := network.NewSecurityGroupsClient(subscriptionID)
 	client.Authorizer = authorizer
+	client.Client.AddToUserAgent(sampleUA)
 
 	name := "sample-nsg"
 
@@ -701,6 +716,7 @@ func setupNetworkSecurityGroup(subscriptionID, resourceGroupName string, authori
 func setupPublicIP(subscriptionID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (created network.PublicIPAddress, err error) {
 	client := network.NewPublicIPAddressesClient(subscriptionID.String())
 	client.Authorizer = authorizer
+	client.Client.AddToUserAgent(sampleUA)
 
 	name := "sample-publicip"
 
@@ -722,6 +738,7 @@ func setupPublicIP(subscriptionID uuid.UUID, group resources.Group, authorizer a
 func setupStorageAccount(subscriptionID uuid.UUID, group resources.Group, authorizer autorest.Authorizer) (<-chan storage.Account, <-chan error) {
 	client := storage.NewAccountsClient(subscriptionID.String())
 	client.Authorizer = authorizer
+	client.Client.AddToUserAgent(sampleUA)
 
 	storageAccountName := "sample"
 	storageAccountName = storageAccountName + string([]byte(uuid.NewV4().String())[:8])
@@ -737,7 +754,7 @@ func setupStorageAccount(subscriptionID uuid.UUID, group resources.Group, author
 
 // authenticate gets an authorization token to allow clients to access Azure assets.
 func authenticate(clientID uuid.UUID) (token *adal.Token, err error) {
-	authClient := autorest.NewClientWithUserAgent("github.com/Azure-Samples/arm-compute-go-vm-extensions")
+	authClient := autorest.NewClientWithUserAgent(sampleUA)
 	var deviceCode *adal.DeviceCode
 	var config *adal.OAuthConfig
 
@@ -802,6 +819,7 @@ func getTenants(authorizer autorest.Authorizer) (<-chan subscriptions.TenantIDDe
 
 		tenantClient := subscriptions.NewTenantsClient()
 		tenantClient.Authorizer = authorizer
+		tenantClient.Client.AddToUserAgent(sampleUA)
 
 		var fetchTenants func() (subscriptions.TenantListResult, error)
 		fetchTenants = tenantClient.List
@@ -844,6 +862,7 @@ func getSubscriptions(authorizer autorest.Authorizer) (<-chan subscriptions.Subs
 
 		client := subscriptions.NewGroupClient()
 		client.Authorizer = authorizer
+		client.Client.AddToUserAgent(sampleUA)
 
 		var fetchSubscriptions func() (subscriptions.ListResult, error)
 		fetchSubscriptions = client.List

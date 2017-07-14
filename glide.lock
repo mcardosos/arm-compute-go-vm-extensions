@@ -1,31 +1,32 @@
-hash: 73d8cbf1f965e5b5ac50754dd4547c358c7fa7cd22d8772f8f465ada3ede2075
-updated: 2017-05-12T16:43:28.8843665-07:00
+hash: f0ae5ec053ed52d426f3a583e4512b9490dc08e8fc5b95126bd610ffb97768c5
+updated: 2017-07-13T17:25:33.996954-07:00
 imports:
 - name: github.com/Azure/azure-sdk-for-go
-  version: 5841475edc7c8725d79885d635aa8956f97fdf0e
+  version: 2629e2dfcfeab50896230140542c3b9d89b35ae1
   subpackages:
   - arm/compute
-  - arm/network
-  - arm/resources/resources
   - arm/disk
   - arm/graphrbac
   - arm/keyvault
+  - arm/network
+  - arm/resources/resources
   - arm/resources/subscriptions
   - arm/storage
   - dataplane/keyvault
 - name: github.com/Azure/go-autorest
-  version: 58f6f26e200fa5dfb40c9cd1c83f3e2c860d779d
+  version: 5b4b9cc27e8f7150d75a133d74b176a067b7e7b6
   subpackages:
   - autorest
-  - autorest/azure
-  - autorest/to
   - autorest/adal
+  - autorest/azure
   - autorest/date
+  - autorest/to
+  - autorest/utils
   - autorest/validation
 - name: github.com/dgrijalva/jwt-go
-  version: 2268707a8f0843315e2004ee4f1d021dc08baedf
+  version: a539ee1a749a2b895533f979515ac7e6e0f5b650
 - name: github.com/marstr/guid
   version: 8bd9a64bf37eb297b492a4101fb28e80ac0b290f
 - name: github.com/satori/uuid
-  version: 879c5887cd475cd7864858769793b2ceb0d44feb
+  version: 5bf94b69c6b68ee1b541973bb8e1144db23a194b
 testImports: []
